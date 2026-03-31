@@ -1,0 +1,6 @@
+.gitignore
+.eslintrc*
+eslint.config.mjs
+node_modules/**
+*.vsix
+package-lock.json

@@ -1,0 +1,36 @@
+{
+  "name": "markdown-toggle",
+  "displayName": "Markdown Preview Toggle",
+  "description": "Status bar buttons to toggle Markdown preview and force a light theme in the preview pane",
+  "version": "1.2.0",
+  "publisher": "vendor",
+  "engines": { "vscode": "^1.75.0" },
+  "categories": ["Other"],
+  "activationEvents": ["onLanguage:markdown", "onCommand:markdownToggle.togglePreview", "onCommand:markdownToggle.toggleLightTheme"],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "markdownToggle.togglePreview",
+        "title": "Toggle Markdown Preview"
+      },
+      {
+        "command": "markdownToggle.toggleLightTheme",
+        "title": "Toggle Markdown Preview Light Theme"
+      }
+    ],
+    "configuration": {
+      "title": "Markdown Preview Toggle",
+      "properties": {
+        "markdownToggle.lightPreview": {
+          "type": "boolean",
+          "default": true,
+          "description": "Force the Markdown preview pane to always render with a light theme (white background, black text), regardless of the active VS Code colour theme."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "package": "vsce package"
+  }
+}

@@ -1,0 +1,16 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+out/
+dist/
+*.vsix
+*.js.map
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Editor noise
+.vscode/settings.json
+*.log
