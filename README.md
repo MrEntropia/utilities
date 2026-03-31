@@ -6,7 +6,7 @@ Personal productivity tools and VS Code extensions.
 
 | Tool | Description | Version |
 |---|---|---|
-| [vscode-markdown-toggle](./vscode-markdown-toggle/) | VS Code status bar toggle for Markdown preview with optional forced light theme | 1.2.0 |
+| [vscode-markdown-toggle](./vscode-markdown-toggle/) | VS Code status bar toggle for Markdown preview with optional forced light theme | 1.2.4 |
 
 ## Structure
 
