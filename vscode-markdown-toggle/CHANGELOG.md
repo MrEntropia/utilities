@@ -5,6 +5,20 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.2.2] — 2026-03-31 — Stale Version Cleanup
+
+### Fixed
+- **Stale CSS path after update:** When upgrading across versions (e.g. 1.2.0 → 1.2.1), the old version's `preview-light.css` path lingered in `markdown.styles` because the extension path includes the version number. `getCleanStyles()` now removes CSS paths from **any** previous version of this extension, not just the current one.
+
+---
+
+## [1.2.1] — 2026-03-31 — Empty String Sanitization
+
+### Fixed
+- **Empty string sanitization:** `getCleanStyles()` now strips empty and blank entries from `markdown.styles` on activation, preventing "Could not load 'markdown.styles'" warnings left by previous installs.
+
+---
+
 ## [1.2.0] — 2026-03-31 — Toggleable Light Theme
 
 ### Added

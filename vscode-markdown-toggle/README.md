@@ -1,6 +1,6 @@
 # Markdown Preview Toggle - VS Code Extension
 
-**Version:** 1.2.0
+**Version:** 1.2.2
 **Author:** vendor
 **VS Code Minimum Version:** 1.75.0
 
@@ -24,7 +24,7 @@ Both buttons appear automatically when you open a `.md` file and hide when you s
 ### Option 1 — Command Line (Recommended)
 
 ```bash
-code --install-extension markdown-toggle-1.2.0.vsix
+code --install-extension markdown-toggle-1.2.2.vsix
 ```
 
 ### Option 2 — VS Code UI
@@ -33,7 +33,7 @@ code --install-extension markdown-toggle-1.2.0.vsix
 2. Press `Ctrl+Shift+X` (Windows/Linux) or `Cmd+Shift+X` (macOS) to open the Extensions panel
 3. Click the `···` menu in the top-right corner of the Extensions panel
 4. Select **"Install from VSIX..."**
-5. Navigate to and select `markdown-toggle-1.2.0.vsix`
+5. Navigate to and select `markdown-toggle-1.2.2.vsix`
 6. Click **Install** when prompted
 7. Reload VS Code if asked
 
@@ -137,13 +137,19 @@ This extension has been audited against the following threat categories:
 | Race condition (double-click) | ✅ Fixed in v1.0.1 — `toggling` lock with `try/finally` |
 | Null dereference in status bar items | ✅ Null guards on both `previewBtn` and `themeBtn` |
 | CSS external resource leakage | ✅ `preview-light.css` has no `url()` or `@import` references |
-| `markdown.styles` pollution | ✅ Cleaned up on deactivation; only our own entry is ever removed |
+| `markdown.styles` pollution | ✅ Cleaned up on deactivation; stale entries from previous versions also removed |
 
 See `SECURITY.md` for full details.
 
 ---
 
 ## Changelog
+
+### v1.2.2 — Stale version cleanup
+- Fixed stale CSS paths left in `markdown.styles` when upgrading across versions
+
+### v1.2.1 — Empty string sanitization
+- Fixed empty string entries in `markdown.styles` causing load warnings on activation
 
 ### v1.2.0 — Toggleable light theme
 - New `⊙ Light` status bar button to toggle light theme on/off at runtime
