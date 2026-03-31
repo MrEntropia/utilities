@@ -3,7 +3,11 @@
   "displayName": "Markdown Preview Toggle",
   "description": "Status bar buttons to toggle Markdown preview and force a light theme in the preview pane",
   "version": "1.2.0",
-  "publisher": "vendor",
+  "publisher": "MrEntropia",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/MrEntropia/utilities.git"
+  },
   "engines": { "vscode": "^1.75.0" },
   "categories": ["Other"],
   "activationEvents": ["onLanguage:markdown", "onCommand:markdownToggle.togglePreview", "onCommand:markdownToggle.toggleLightTheme"],
@@ -31,6 +35,6 @@
     }
   },
   "scripts": {
-    "package": "vsce package"
+    "package": "@vscode/vsce package"
   }
 }
