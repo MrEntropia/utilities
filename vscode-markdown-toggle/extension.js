@@ -18,31 +18,31 @@ function isLightThemeEnabled() {
     .get('lightPreview', true);
 }
 
+function getCleanStyles(config, excludePath) {
+  // Read markdown.styles and strip empty/blank entries and our own path
+  const styles = config.get('styles', []) || [];
+  return styles.filter(s => s && s.trim() !== '' && s !== excludePath);
+}
+
 async function applyLightTheme(context) {
   const cssPath = getLightCssPath(context);
   const config = vscode.workspace.getConfiguration('markdown');
-  const styles = config.get('styles', []);
-  if (!styles.includes(cssPath)) {
-    await config.update(
-      'styles',
-      [...styles, cssPath],
-      vscode.ConfigurationTarget.Global
-    );
-  }
+  const cleaned = getCleanStyles(config, cssPath); // remove empties + dedupe
+  await config.update(
+    'styles',
+    [...cleaned, cssPath],
+    vscode.ConfigurationTarget.Global
+  );
 }
 
 async function removeLightTheme(context) {
   const cssPath = getLightCssPath(context);
   const config = vscode.workspace.getConfiguration('markdown');
-  const styles = config.get('styles', []);
-  const filtered = styles.filter(s => s !== cssPath);
-  if (filtered.length !== styles.length) {
-    await config.update('styles', filtered, vscode.ConfigurationTarget.Global);
-  }
+  const cleaned = getCleanStyles(config, cssPath); // remove empties + our path
+  await config.update('styles', cleaned, vscode.ConfigurationTarget.Global);
 }
 
 async function refreshPreview() {
-  // If preview is open, bounce it so the new CSS takes effect immediately
   if (previewOpen) {
     await vscode.commands.executeCommand('workbench.action.closeEditorsInOtherGroups');
     await vscode.commands.executeCommand('markdown.showPreviewToSide');
@@ -91,6 +91,7 @@ function activate(context) {
   updateThemeBtn(isLightThemeEnabled());
 
   // Apply or remove light CSS on startup based on saved setting
+  // This also self-heals any empty string entries left by previous installs
   if (isLightThemeEnabled()) {
     applyLightTheme(context);
   } else {
@@ -131,12 +132,10 @@ function activate(context) {
       const nowEnabled = isLightThemeEnabled();
       const next = !nowEnabled;
 
-      // Persist the setting
       await vscode.workspace
         .getConfiguration('markdownToggle')
         .update('lightPreview', next, vscode.ConfigurationTarget.Global);
 
-      // Apply or remove CSS from markdown.styles
       if (next) {
         await applyLightTheme(context);
       } else {
@@ -196,7 +195,6 @@ function activate(context) {
 // ─── Deactivate ───────────────────────────────────────────────────────────────
 
 async function deactivate(context) {
-  // Clean up our CSS entry from markdown.styles on uninstall/disable
   if (context) await removeLightTheme(context);
   if (previewBtn) previewBtn.dispose();
   if (themeBtn) themeBtn.dispose();
