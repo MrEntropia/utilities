@@ -5,6 +5,15 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.2.4] — 2026-03-31 — Use markdown.previewStyles
+
+### Fixed
+- **CSS injection completely reworked:** `markdown.styles` does not support absolute paths — it only accepts workspace-relative paths and HTTPS URLs. Replaced runtime `markdown.styles` manipulation with the proper `contributes.markdown.previewStyles` contribution point in `package.json`.
+- **Toggle mechanism:** Light theme is now toggled by writing full CSS or a no-op comment to `preview-light.css` at runtime, then refreshing the preview.
+- **Cleanup:** On activation, any stale `markdown.styles` entries left by previous versions (< 1.2.4) are automatically removed.
+
+---
+
 ## [1.2.3] — 2026-03-31 — Windows Path Fix
 
 ### Fixed

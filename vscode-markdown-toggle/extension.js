@@ -1,4 +1,5 @@
 const vscode = require('vscode');
+const fs = require('fs');
 const path = require('path');
 
 let previewBtn;
@@ -6,10 +7,101 @@ let themeBtn;
 let previewOpen = false;
 let toggling = false;
 
+// ─── Light‑theme CSS (written to preview‑light.css at runtime) ──────────────
+
+const LIGHT_CSS = `/*
+  Markdown Preview Toggle — Force Light Theme
+  Overrides VS Code's dark/high-contrast theme colors in the preview pane,
+  ensuring black text on a white background regardless of the editor theme.
+*/
+
+:root {
+  --vscode-editor-background: #ffffff !important;
+  --vscode-editor-foreground: #000000 !important;
+}
+
+body {
+  background-color: #ffffff !important;
+  color: #000000 !important;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+}
+
+/* Headings */
+h1, h2, h3, h4, h5, h6 {
+  color: #111111 !important;
+  border-bottom-color: #dddddd !important;
+}
+
+/* Paragraphs and inline text */
+p, li, td, th, dt, dd, blockquote {
+  color: #222222 !important;
+}
+
+/* Links */
+a {
+  color: #0060c0 !important;
+}
+a:hover {
+  color: #003f8a !important;
+}
+
+/* Code blocks */
+pre {
+  background-color: #f5f5f5 !important;
+  border: 1px solid #e0e0e0 !important;
+  color: #1a1a1a !important;
+}
+
+code {
+  background-color: #f0f0f0 !important;
+  color: #c7254e !important;
+}
+
+pre code {
+  background-color: transparent !important;
+  color: #1a1a1a !important;
+}
+
+/* Blockquotes */
+blockquote {
+  background-color: #f9f9f9 !important;
+  border-left: 4px solid #cccccc !important;
+  color: #555555 !important;
+}
+
+/* Tables */
+table {
+  border-collapse: collapse;
+}
+th {
+  background-color: #f0f0f0 !important;
+  color: #111111 !important;
+  border: 1px solid #cccccc !important;
+}
+td {
+  border: 1px solid #dddddd !important;
+  color: #222222 !important;
+}
+tr:nth-child(even) {
+  background-color: #fafafa !important;
+}
+
+/* Horizontal rules */
+hr {
+  border-color: #dddddd !important;
+}
+
+/* Highlighted / marked text */
+mark {
+  background-color: #fff176 !important;
+  color: #000000 !important;
+}
+`;
+
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
-function getLightCssPath(context) {
-  return path.join(context.extensionPath, 'preview-light.css').replace(/\\/g, '/');
+function getCssFilePath(context) {
+  return path.join(context.extensionPath, 'preview-light.css');
 }
 
 function isLightThemeEnabled() {
@@ -18,35 +110,23 @@ function isLightThemeEnabled() {
     .get('lightPreview', true);
 }
 
-function getCleanStyles(config, excludePath) {
-  // Read markdown.styles and strip empty/blank entries, our own path,
-  // and stale paths left by previous versions of this extension
+function writeCssFile(context, enabled) {
+  const cssPath = getCssFilePath(context);
+  fs.writeFileSync(cssPath, enabled ? LIGHT_CSS : '/* light theme disabled */\n', 'utf8');
+}
+
+function cleanUpMarkdownStyles() {
+  // Remove any stale entries our previous versions wrote into markdown.styles
+  const config = vscode.workspace.getConfiguration('markdown');
   const styles = config.get('styles', []) || [];
-  return styles.filter(s => {
+  const cleaned = styles.filter(s => {
     if (!s || s.trim() === '') return false;
-    if (s === excludePath) return false;
-    // Remove paths from any version of this extension (e.g. .../markdown-toggle-1.2.0/preview-light.css)
     if (/[/\\]mrentropia\.markdown-toggle-[^/\\]+[/\\]preview-light\.css$/i.test(s)) return false;
     return true;
   });
-}
-
-async function applyLightTheme(context) {
-  const cssPath = getLightCssPath(context);
-  const config = vscode.workspace.getConfiguration('markdown');
-  const cleaned = getCleanStyles(config, cssPath); // remove empties + dedupe
-  await config.update(
-    'styles',
-    [...cleaned, cssPath],
-    vscode.ConfigurationTarget.Global
-  );
-}
-
-async function removeLightTheme(context) {
-  const cssPath = getLightCssPath(context);
-  const config = vscode.workspace.getConfiguration('markdown');
-  const cleaned = getCleanStyles(config, cssPath); // remove empties + our path
-  await config.update('styles', cleaned, vscode.ConfigurationTarget.Global);
+  if (cleaned.length !== styles.length) {
+    config.update('styles', cleaned.length > 0 ? cleaned : undefined, vscode.ConfigurationTarget.Global);
+  }
 }
 
 async function refreshPreview() {
@@ -86,6 +166,12 @@ function updateThemeBtn(lightEnabled) {
 
 function activate(context) {
 
+  // Clean up stale markdown.styles entries from previous versions (< 1.2.4)
+  cleanUpMarkdownStyles();
+
+  // Write CSS file based on current setting
+  writeCssFile(context, isLightThemeEnabled());
+
   // -- Preview toggle button (right, priority 100)
   previewBtn = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
   previewBtn.command = 'markdownToggle.togglePreview';
@@ -96,14 +182,6 @@ function activate(context) {
   themeBtn = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 99);
   themeBtn.command = 'markdownToggle.toggleLightTheme';
   updateThemeBtn(isLightThemeEnabled());
-
-  // Apply or remove light CSS on startup based on saved setting
-  // This also self-heals any empty string entries left by previous installs
-  if (isLightThemeEnabled()) {
-    applyLightTheme(context);
-  } else {
-    removeLightTheme(context);
-  }
 
   // -- Command: toggle preview open/closed
   const togglePreviewCmd = vscode.commands.registerCommand(
@@ -143,12 +221,7 @@ function activate(context) {
         .getConfiguration('markdownToggle')
         .update('lightPreview', next, vscode.ConfigurationTarget.Global);
 
-      if (next) {
-        await applyLightTheme(context);
-      } else {
-        await removeLightTheme(context);
-      }
-
+      writeCssFile(context, next);
       updateThemeBtn(next);
       await refreshPreview();
     }
@@ -158,12 +231,8 @@ function activate(context) {
   const onConfigChange = vscode.workspace.onDidChangeConfiguration(async (e) => {
     if (e.affectsConfiguration('markdownToggle.lightPreview')) {
       const enabled = isLightThemeEnabled();
+      writeCssFile(context, enabled);
       updateThemeBtn(enabled);
-      if (enabled) {
-        await applyLightTheme(context);
-      } else {
-        await removeLightTheme(context);
-      }
       await refreshPreview();
     }
   });
@@ -201,8 +270,7 @@ function activate(context) {
 
 // ─── Deactivate ───────────────────────────────────────────────────────────────
 
-async function deactivate(context) {
-  if (context) await removeLightTheme(context);
+function deactivate() {
   if (previewBtn) previewBtn.dispose();
   if (themeBtn) themeBtn.dispose();
 }
