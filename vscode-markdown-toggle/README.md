@@ -1,4 +1,4 @@
-# Markdown Preview Toggle — VS Code Extension
+# Markdown Preview Toggle - VS Code Extension
 
 **Version:** 1.2.0
 **Author:** vendor
