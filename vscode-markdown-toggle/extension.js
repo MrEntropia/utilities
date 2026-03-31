@@ -19,9 +19,16 @@ function isLightThemeEnabled() {
 }
 
 function getCleanStyles(config, excludePath) {
-  // Read markdown.styles and strip empty/blank entries and our own path
+  // Read markdown.styles and strip empty/blank entries, our own path,
+  // and stale paths left by previous versions of this extension
   const styles = config.get('styles', []) || [];
-  return styles.filter(s => s && s.trim() !== '' && s !== excludePath);
+  return styles.filter(s => {
+    if (!s || s.trim() === '') return false;
+    if (s === excludePath) return false;
+    // Remove paths from any version of this extension (e.g. .../markdown-toggle-1.2.0/preview-light.css)
+    if (/[/\\]mrentropia\.markdown-toggle-[^/\\]+[/\\]preview-light\.css$/i.test(s)) return false;
+    return true;
+  });
 }
 
 async function applyLightTheme(context) {

@@ -2,7 +2,7 @@
   "name": "markdown-toggle",
   "displayName": "Markdown Preview Toggle",
   "description": "Status bar buttons to toggle Markdown preview and force a light theme in the preview pane",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "publisher": "MrEntropia",
   "repository": {
     "type": "git",
