@@ -5,6 +5,13 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.2.3] — 2026-03-31 — Windows Path Fix
+
+### Fixed
+- **Backslash paths on Windows:** `path.join` on Windows produced backslash paths (`c:\Users\...`) in `markdown.styles`, which the Markdown preview renderer could not resolve. CSS paths are now normalized to forward slashes (`c:/Users/...`).
+
+---
+
 ## [1.2.2] — 2026-03-31 — Stale Version Cleanup
 
 ### Fixed

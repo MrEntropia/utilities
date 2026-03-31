@@ -9,7 +9,7 @@ let toggling = false;
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 function getLightCssPath(context) {
-  return path.join(context.extensionPath, 'preview-light.css');
+  return path.join(context.extensionPath, 'preview-light.css').replace(/\\/g, '/');
 }
 
 function isLightThemeEnabled() {
