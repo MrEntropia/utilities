@@ -1,6 +1,6 @@
 # Markdown Preview Toggle - VS Code Extension
 
-**Version:** 1.2.2
+**Version:** 1.2.3
 **Author:** vendor
 **VS Code Minimum Version:** 1.75.0
 
@@ -24,7 +24,7 @@ Both buttons appear automatically when you open a `.md` file and hide when you s
 ### Option 1 — Command Line (Recommended)
 
 ```bash
-code --install-extension markdown-toggle-1.2.2.vsix
+code --install-extension markdown-toggle-1.2.3.vsix
 ```
 
 ### Option 2 — VS Code UI
@@ -33,7 +33,7 @@ code --install-extension markdown-toggle-1.2.2.vsix
 2. Press `Ctrl+Shift+X` (Windows/Linux) or `Cmd+Shift+X` (macOS) to open the Extensions panel
 3. Click the `···` menu in the top-right corner of the Extensions panel
 4. Select **"Install from VSIX..."**
-5. Navigate to and select `markdown-toggle-1.2.2.vsix`
+5. Navigate to and select `markdown-toggle-1.2.3.vsix`
 6. Click **Install** when prompted
 7. Reload VS Code if asked
 
