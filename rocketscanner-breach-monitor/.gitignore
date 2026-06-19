@@ -1,0 +1,13 @@
+# Runtime outputs
+reports/
+*.jsonl
+.rocketscanner-state.json
+*.state.json
+
+# Local config (may contain your real vendor watchlist) — keep config.example.json
+config.json
+config.*.json
+!config.example.json
+
+# Secrets
+.env

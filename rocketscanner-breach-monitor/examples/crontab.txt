@@ -1,0 +1,11 @@
+# rocketscanner-breach-monitor — example cron entries
+# Install with: crontab -e   (adjust the absolute paths)
+
+# --- Daily at 07:00, alert via non-zero exit so cron MAILTO emails you ---
+0 7 * * * cd /opt/rocketscanner-breach-monitor && /usr/bin/node bin/cli.js --config config.json --fail-on-find >> /var/log/rsbm.log 2>&1
+
+# --- Near-real-time: every 15 minutes (dedup state prevents repeat alerts) ---
+# */15 * * * * cd /opt/rocketscanner-breach-monitor && /usr/bin/node bin/cli.js --config config.json --fail-on-find >> /var/log/rsbm.log 2>&1
+
+# Tip: set MAILTO=you@example.com at the top of your crontab to receive output
+# only when the job exits non-zero (i.e. when --fail-on-find detects findings).

@@ -1,0 +1,43 @@
+# Example scheduled workflow for rocketscanner-breach-monitor.
+# Copy to .github/workflows/breach-monitor.yml to activate.
+#
+# Runs the monitor daily, uploads the JSON report as an artifact, and (because
+# of --fail-on-find) marks the run as failed when a watchlisted vendor appears
+# — which triggers GitHub's normal failed-workflow notifications.
+
+name: vendor-breach-monitor
+
+on:
+  schedule:
+    - cron: '0 7 * * *'   # daily 07:00 UTC; use '*/15 * * * *' for ~15-min latency
+  workflow_dispatch: {}    # allow manual runs
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rocketscanner-breach-monitor
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Run breach monitor
+        env:
+          # Only needed if you enable HIBP subscriber endpoints; optional otherwise.
+          HIBP_API_KEY: ${{ secrets.HIBP_API_KEY }}
+        run: node bin/cli.js --config config.json --fail-on-find
+
+      - name: Upload findings report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: breach-findings
+          path: rocketscanner-breach-monitor/reports/
+          if-no-files-found: ignore

@@ -1,0 +1,48 @@
+{
+  "lookbackDays": 2,
+  "sources": {
+    "hibp": {
+      "enabled": true,
+      "url": "https://haveibeenpwned.com/api/v3/breaches",
+      "apiKeyEnv": "HIBP_API_KEY"
+    },
+    "ransomwareLive": {
+      "enabled": true,
+      "url": "https://api.ransomware.live/v2/recentvictims"
+    },
+    "rss": {
+      "enabled": true,
+      "feeds": [
+        { "name": "databreaches", "url": "https://databreaches.net/feed/" },
+        { "name": "bleepingcomputer", "url": "https://www.bleepingcomputer.com/feed/" },
+        { "name": "thehackernews", "url": "https://feeds.feedburner.com/TheHackersNews" }
+      ]
+    }
+  },
+  "watchlist": [
+    {
+      "name": "Okta",
+      "domains": ["okta.com"],
+      "aliases": ["Auth0"],
+      "severity": "high",
+      "tags": ["identity", "critical-vendor"]
+    },
+    {
+      "name": "Cloudflare",
+      "domains": ["cloudflare.com"],
+      "severity": "high",
+      "tags": ["infrastructure"]
+    },
+    {
+      "name": "Acme Payroll",
+      "domains": ["acme-payroll.example"],
+      "aliases": ["AcmePay"],
+      "severity": "medium",
+      "tags": ["hr"]
+    }
+  ],
+  "alerters": {
+    "console": { "enabled": true },
+    "jsonFile": { "enabled": true, "dir": "reports" }
+  }
+}

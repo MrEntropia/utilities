@@ -1,0 +1,33 @@
+{
+  "name": "rocketscanner-breach-monitor",
+  "version": "0.1.0",
+  "description": "Monitors public breach-intelligence feeds and alerts when a watchlisted vendor appears (daily batch, dependency-free).",
+  "publisher": "MrEntropia",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/MrEntropia/utilities.git",
+    "directory": "rocketscanner-breach-monitor"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "type": "commonjs",
+  "main": "src/index.js",
+  "bin": {
+    "rocketscanner-breach-monitor": "bin/cli.js"
+  },
+  "scripts": {
+    "start": "node bin/cli.js",
+    "test": "node --test"
+  },
+  "keywords": [
+    "security",
+    "breach",
+    "threat-intelligence",
+    "vendor-risk",
+    "ransomware",
+    "hibp",
+    "monitoring"
+  ]
+}
