@@ -1,6 +1,6 @@
 {
   "name": "rocketscanner-breach-monitor",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Monitors public breach-intelligence feeds and alerts when a watchlisted vendor appears (daily batch, dependency-free).",
   "publisher": "MrEntropia",
   "license": "MIT",

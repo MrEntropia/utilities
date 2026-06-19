@@ -46,6 +46,50 @@ A finding is produced when a vendor matches on **domain** (exact or subdomain)
 or on a **word-boundary term** in the title/summary (so `IBM` won't match
 `calibmatic`).
 
+## Vetting a domain / onboarding a vendor
+
+Two separate, on-demand checks (independent of the scheduled monitor):
+
+### 1. Was this domain breached? — `check`
+
+A read-only lookup against HIBP's public per-domain breaches endpoint.
+
+```bash
+# Full breach history for a domain
+node bin/cli.js check okta.com
+
+# Only breaches in the last 24 months
+node bin/cli.js check okta.com --months 24
+
+# Check every domain already on your watchlist
+node bin/cli.js check --config config.json --all
+```
+
+Exits `2` if any checked domain is breached within the window (clean = `0`),
+so it drops straight into a CI/onboarding gate. Add `--json` for machine output.
+
+### 2. Add a vendor with a 24-month back-check — `add`
+
+Registers the vendor on your watchlist **and** immediately back-checks whether
+its domain was breached in the last 24 months:
+
+```bash
+node bin/cli.js add "Okta" --domain okta.com --alias Auth0 \
+  --severity high --tags identity,critical-vendor \
+  --config config.json
+```
+
+- The vendor is appended to `config.json` (idempotent — never duplicates) so
+  it's monitored on every subsequent run.
+- The back-check window defaults to **24 months**; change it with `--months`.
+- Exit code `2` if the vendor was breached within the window — a
+  recently-breached vendor is still added (you'll want to keep watching it),
+  but the non-zero exit flags it for human review during onboarding.
+- Omit `--config` to print the watchlist entry instead of writing a file.
+
+> Both commands report older breaches as context even when they fall outside
+> the window, and use `BreachDate` (when the breach occurred) for the window.
+
 ## Output
 
 - **Console**: human-readable summary, highest severity first.
@@ -55,6 +99,14 @@ or on a **word-boundary term** in the title/summary (so `IBM` won't match
     SIEM / log pipeline).
 
 ## CLI
+
+```
+rocketscanner-breach-monitor [monitor] [options]   Scan feeds (default command)
+rocketscanner-breach-monitor check <domain...>     Was a domain breached?
+rocketscanner-breach-monitor add <name> --domain d  Add vendor + 24-month back-check
+```
+
+`monitor` options (the default command):
 
 ```
 --config <path>      Config JSON (watchlist, sources, alerters).
