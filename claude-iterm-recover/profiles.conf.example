@@ -1,0 +1,13 @@
+# One iTerm2 profile per line:  <name>=<directory>[=<guid>]
+#
+#   name       shows up as "Claude · <name>" in iTerm2 and as the Remote Control
+#              session name on claude.ai/code and the mobile app
+#   directory  where Claude Code starts
+#   guid       optional; pin it to keep a profile iTerm2 already knows (window
+#              arrangements and per-profile tweaks are tied to the GUID). Left
+#              out, a stable GUID is derived from the name.
+#
+# Copy to ~/.config/claude-iterm-recover/profiles.conf and edit.
+
+Rocket-scanner=/Users/me/Projects/Rocket-scanner
+website=/Users/me/Projects/website
