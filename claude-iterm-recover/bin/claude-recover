@@ -1,0 +1,119 @@
+#!/bin/zsh
+# claude-recover [--quiet] [--list] [<uuid>...]
+#
+# Reopen Claude Code sessions that claude-tab recorded and that ended abruptly.
+#
+#   (no args)   reopen every live marker in ~/.claude/iterm-sessions/ whose
+#               claude process is not running any more
+#   --quiet     same, but silent and without launching iTerm2 when there is
+#               nothing to do (this is what the login LaunchAgent runs)
+#   --list      show recoverable and recently closed-by-hand sessions
+#   <uuid>...   reopen those sessions, from either the live or the closed/ set
+#
+# Each session comes back in its own iTerm2 tab, in its original profile, as
+# `claude --resume <uuid> --remote-control <name>`. A marker whose transcript
+# no longer exists is started fresh instead.
+set -u
+
+markers=$HOME/.claude/iterm-sessions
+closed=$markers/closed
+tab=$HOME/.local/bin/claude-tab
+mkdir -p "$closed"
+
+quiet=0; list=0; picks=()
+for a in "$@"; do
+  case $a in
+    --quiet) quiet=1 ;;
+    --list)  list=1 ;;
+    *)       picks+=("$a") ;;
+  esac
+done
+
+# Markers closed by hand are kept a week so a specific one can be reopened.
+find "$closed" -name '*.json' -mtime +7 -delete 2>/dev/null
+
+say() { (( quiet )) || print -- "$@" }
+log() { print -- "$(date +%FT%T) $*" }
+
+field() { jq -r ".$2" "$1" }
+
+is_running() { ps -axo args= | grep -E -- "--(session-id|resume) $1( |$)" | grep -qv grep }
+
+transcript_exists() {
+  local dir=$1 uuid=$2
+  [[ -s "$HOME/.claude/projects/${dir//[\/.]/-}/$uuid.jsonl" ]]
+}
+
+open_tab() {
+  local profile=$1 cmd=$2
+  osascript - "$profile" "$cmd" <<'EOF'
+on run argv
+  set p to item 1 of argv
+  set c to item 2 of argv
+  tell application "iTerm2"
+    activate
+    if (count of windows) = 0 then
+      create window with profile p command c
+    else
+      tell current window to create tab with profile p command c
+    end if
+  end tell
+end run
+EOF
+}
+
+reopen() {
+  local f=$1
+  local uuid name dir profile
+  uuid=$(field "$f" uuid); name=$(field "$f" name); dir=$(field "$f" dir); profile=$(field "$f" profile)
+  local arg="'$uuid'"
+  if ! transcript_exists "$dir" "$uuid"; then
+    log "  $name: no transcript for $uuid, starting fresh"
+    arg=""
+  else
+    log "  $name: resuming $uuid ($dir)"
+  fi
+  local cmd="/bin/zsh -lc \"'$tab' '$name' '$dir' $arg; exec /bin/zsh -il\""
+  # The reopened claude-tab rewrites the marker itself. Drop the old copy only
+  # once iTerm2 confirmed the tab, so a failed open leaves it recoverable.
+  if out=$(open_tab "$profile" "$cmd" 2>&1); then
+    rm -f "$f"
+  else
+    log "  $name: could not open a tab, marker kept: $out"
+  fi
+}
+
+if (( list )); then
+  print "Recoverable (ended abruptly):"
+  for f in "$markers"/*.json(N); do
+    u=$(field "$f" uuid)
+    if is_running "$u"; then st="running"; else st="recoverable"; fi
+    print "  $u  $(field "$f" name)  $(field "$f" started)  [$st]"
+  done
+  print "Closed by hand (last 7 days):"
+  for f in "$closed"/*.json(N); do
+    print "  $(field "$f" uuid)  $(field "$f" name)  $(field "$f" started)"
+  done
+  exit 0
+fi
+
+todo=()
+if (( ${#picks} )); then
+  for u in "${picks[@]}"; do
+    if [[ -f $markers/$u.json ]]; then todo+=("$markers/$u.json")
+    elif [[ -f $closed/$u.json ]]; then todo+=("$closed/$u.json")
+    else print -u2 "claude-recover: no marker for $u"; fi
+  done
+else
+  for f in "$markers"/*.json(N); do
+    is_running "$(field "$f" uuid)" || todo+=("$f")
+  done
+fi
+
+if (( ${#todo} == 0 )); then
+  say "claude-recover: nothing to recover"
+  exit 0
+fi
+
+log "claude-recover: reopening ${#todo} session(s)"
+for f in "${todo[@]}"; do reopen "$f"; done

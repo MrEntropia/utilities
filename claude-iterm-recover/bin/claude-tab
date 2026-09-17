@@ -1,0 +1,79 @@
+#!/bin/zsh
+# claude-tab <name> <dir> [uuid]
+#
+# Launch Claude Code in <dir> with Remote Control enabled and named <name>.
+# Leaves a marker in ~/.claude/iterm-sessions/ for as long as the session is
+# running; claude-recover reopens every session whose marker survived, which
+# only happens when the session ended abruptly:
+#
+#   normal exit (/exit, Ctrl-C)            marker removed
+#   tab closed by hand (HUP, iTerm2 stays) marker moved to closed/ (manual)
+#   Cmd-Q / Restart / Shut Down (iTerm2 goes) marker kept        (recoverable)
+#   iTerm2 crash / Force Quit (HUP, gone)  marker kept        (recoverable)
+#   claude killed by a signal              marker kept        (recoverable)
+#   reboot / power loss (nothing runs)     marker kept        (recoverable)
+#
+# With a third argument the same conversation is resumed instead of started.
+set -u
+
+name=${1:?usage: claude-tab <name> <dir> [uuid]}
+dir=${2:?usage: claude-tab <name> <dir> [uuid]}
+uuid=${3:-}
+claude_bin=${CLAUDE_TAB_BIN:-$HOME/.local/bin/claude}
+markers=$HOME/.claude/iterm-sessions
+mkdir -p "$markers/closed"
+
+resume=0
+if [[ -z $uuid ]]; then
+  uuid=$(uuidgen | tr 'A-Z' 'a-z')
+else
+  resume=1
+fi
+marker=$markers/$uuid.json
+
+cd "$dir" || exit 1
+
+jq -n --arg uuid "$uuid" --arg name "$name" --arg dir "$dir" \
+      --arg profile "${ITERM_PROFILE:-Default}" --arg started "$(date -u +%FT%TZ)" \
+      '{uuid:$uuid,name:$name,dir:$dir,profile:$profile,started:$started}' > "$marker"
+
+# keep=1 leaves the marker in place for claude-recover.
+keep=0
+cleanup() {
+  (( keep )) && return
+  if [[ ${manual:-0} == 1 ]]; then
+    mv -f "$marker" "$markers/closed/" 2>/dev/null
+  else
+    rm -f "$marker"
+  fi
+}
+iterm_alive() { ps -axo comm= | grep -q '/MacOS/iTerm2$' }
+on_hup() {
+  # The pty closed under us. A tab closed by hand leaves iTerm2 running; Cmd-Q,
+  # Restart, Shut Down or a crash take iTerm2 away within moments, so watch for
+  # up to 3s before calling it manual. If logout kills us mid-wait the marker
+  # is simply left on disk, which is the recoverable outcome.
+  local i
+  for i in {1..12}; do
+    iterm_alive || { keep=1; exit 129 }
+    sleep 0.25
+  done
+  manual=1
+  exit 129
+}
+trap on_hup HUP
+trap cleanup EXIT
+
+if (( resume )); then
+  "$claude_bin" --resume "$uuid" --remote-control "$name"
+else
+  "$claude_bin" --session-id "$uuid" --remote-control "$name"
+fi
+rc=$?
+
+# 128+N is death by signal N; the tab is still here but the session is not.
+if (( rc >= 128 )); then
+  keep=1
+  print -u2 "claude-tab: claude died by signal $((rc - 128)); session $uuid kept for recovery (run claude-recover)"
+fi
+exit $rc
