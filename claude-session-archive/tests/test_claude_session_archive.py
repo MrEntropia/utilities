@@ -547,6 +547,13 @@ class SecretsTests(Base):
         self.e.run("secrets")
         self.assertNotIn("OpenAI API key", (self.e.archive / "SECRETS.md").read_text(encoding="utf-8"))
 
+    def test_key_shapes_inside_base64_are_not_keys(self):
+        blob = "iVBORw0KGgoAAAANSUhEUgAA/CgANAB+FAB26UAGaAD8KAKuqf8eMv0oAYPp+" + fake("AIza", 35) + "+N8aE1dM2HvQAGgAo=="
+        self.e.write_session("ffff7777", transcript(prompt="data:image/png;base64," + blob))
+        self.e.run("sync")
+        self.e.run("secrets")
+        self.assertNotIn("Google API key", (self.e.archive / "SECRETS.md").read_text(encoding="utf-8"))
+
     def test_ignore_list_and_fail_flag(self):
         report = (lambda: (self.e.archive / "SECRETS.md").read_text(encoding="utf-8"))
         self.e.run("secrets")

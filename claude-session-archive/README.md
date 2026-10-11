@@ -230,7 +230,7 @@ For each real credential, **rotate it** with the service that issued it: it is s
 { "ignore": ["3f2a9c1b7d4e"] }
 ```
 
-These are pattern matches, not proof: expect some false positives, and do not treat an empty report as a guarantee. A credential with no recognisable shape (a plain password typed into a sentence) will not be found.
+These are pattern matches, not proof. Expect false positives, most often test fixtures: if you work on code that handles credentials, its tests are full of realistic fake keys. Look at the session before rotating anything, and silence fixtures with the ignore list. Do not treat an empty report as a guarantee. A credential with no recognisable shape (a plain password typed into a sentence) will not be found.
 
 ## Uninstall
 

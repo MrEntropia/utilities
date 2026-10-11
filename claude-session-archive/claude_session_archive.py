@@ -790,7 +790,7 @@ SECRET_PATTERNS = [
     ("Slack token", re.compile(r"\bxox[abposr]-[A-Za-z0-9-]{10,200}")),
     ("Slack webhook", re.compile(r"hooks\.slack\.com/services/[A-Za-z0-9/]{20,120}")),
     ("Stripe live key", re.compile(r"\b[rs]k_live_[A-Za-z0-9]{16,200}")),
-    ("Google API key", re.compile(r"\bAIza[0-9A-Za-z_-]{35}")),
+    ("Google API key", re.compile(r"(?<![A-Za-z0-9+/=_-])AIza[0-9A-Za-z_-]{35}(?![A-Za-z0-9_-])")),
     ("npm token", re.compile(r"\bnpm_[A-Za-z0-9]{36}")),
     ("Database URL with password", re.compile(
         r"\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp)://[^:@/\s\"'\\]{1,100}:[^@/\s\"'\\]{3,200}@")),
