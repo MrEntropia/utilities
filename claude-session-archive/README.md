@@ -12,7 +12,7 @@ This tool:
 2. copies new and grown transcripts to an archive folder once a day, from every computer you install it on, and never deletes or shrinks anything there;
 3. writes two indexes into that folder: `INDEX.md` (one line per session, by group, with its type and where it ran) and `SESSIONS.md` (every session in full: dates, project, where it ran, summary, a "Keep" note, first request, transcript path).
 
-**Transcripts of local sessions only.** It archives sessions that ran on your computers (the terminal, the desktop app, IDE extensions). Sessions that ran in the cloud on [claude.ai/code](https://claude.ai/code) are stored by Anthropic, not on your disk, so their transcripts cannot be archived; you can still list them in the index, see [Cloud sessions](#cloud-sessions).
+It also brings in sessions that only claude.ai still has: cloud sessions from [claude.ai/code](https://claude.ai/code), and Remote Control sessions whose local transcript was already deleted. That takes one manual export from your browser; see [Sessions on claude.ai](#sessions-on-claudeai). And it can scan everything it keeps for passwords, API keys and other credentials; see [Scanning for secrets](#scanning-for-secrets).
 
 ## What you get
 
@@ -20,15 +20,18 @@ This tool:
 Claude Session Archive/
   INDEX.md            one line per session by group, then your curated notes (generated: do not edit)
   SESSIONS.md         every session in full (generated: do not edit)
+  SECRETS.md          credentials found by `secrets`, masked (generated: do not edit)
   LAST-SYNC.txt       when, and from which computer, the last sync ran
   data/               yours: the sync reads these and never writes them (except creating curated.md once)
     groups.json       which group each session belongs to
     summaries.json    summary, keep note and type per session
-    cloud.json        cloud sessions (claude.ai/code) to list in the index
+    cloud.json        optional details for cloud sessions (claude.ai/code)
+    secrets-ignore.json   fingerprints that `secrets` should stop reporting
     curated.md        your notes on projects worth keeping; shown at the end of INDEX.md
   all-sessions/
     projects/...      copies of every transcript and Claude Code project memory
     computers/<computer>.json   which sessions each computer holds (each computer writes only its own)
+    cloud/session_<id>.json     sessions saved from claude.ai with `import`
     versions/<computer>/...   any copy that differs from the archived one without simply having grown
                               (e.g. a memory note edited on two computers): kept beside it, never over it
 ```
@@ -88,6 +91,8 @@ claude-session-archive status          # archive, hook, retention, last sync, lo
 claude-session-archive sync            # sync now
 claude-session-archive index           # only rebuild INDEX.md and SESSIONS.md (after editing data/)
 claude-session-archive digest OUTDIR --missing-only   # see "Summaries" below
+claude-session-archive import FILE...  # file sessions exported from claude.ai, see "Sessions on claude.ai"
+claude-session-archive secrets         # scan for credentials, see "Scanning for secrets"
 ```
 
 ### Groups
@@ -143,12 +148,13 @@ What the tool does and does not do, so you can verify it (it is one file, `claud
 - **No network access.** The script makes no network requests and runs no other programs. Anything that reaches the cloud gets there only because *you* put the archive inside a folder that your own sync client uploads. The installers use the network only to install Python if it is missing (Homebrew, your Linux package manager, or `winget`).
 - **Reads** `~/.claude/projects/` and `~/.claude/settings.json`. **Writes** the archive folder, its own config folder (`~/.config/claude-session-archive/`, or `%APPDATA%\claude-session-archive`), the command shim, `~/.claude/settings.json` (after saving a timestamped backup next to it, and only if it is valid JSON) and, if needed, one PATH line in your shell rc file / user PATH.
 - **Never deletes** anything in the archive, and never touches your transcripts.
+- **`export-claude-ai.js` is separate and runs only when you paste it into your browser.** It sends GET requests to claude.ai, with your own sign-in, and downloads files to your computer; it sends nothing anywhere else.
 - **The hook runs no shell.** It is registered in exec form (an absolute path to Python plus arguments), so paths with spaces or quotes cannot be misread and nothing is interpreted by a shell.
 
 **Your transcripts are sensitive, and the archive is a copy of them.** A transcript contains everything said in the session and much of what was read or run in it: source code, file contents, command output, and anything you pasted, including tokens, passwords, API keys or customer data. `SESSIONS.md` and `INDEX.md` quote each session's first request. So:
 
 - Keep the archive in a **private** folder. Do not put it in a shared drive or a folder shared with others, and do not commit it to a repository.
-- If a secret was pasted into a session, treat it as stored wherever the archive is synced: rotate it, then delete it from the transcript copy if you want it gone.
+- If a secret was pasted into a session, treat it as stored wherever the archive is synced: rotate it, then delete it from the transcript copy if you want it gone. `claude-session-archive secrets` finds them for you.
 - Your cloud provider can read what you store there unless you use end-to-end encryption (for example iCloud Advanced Data Protection, or an encrypted folder such as Cryptomator).
 - Anyone who can write to the archive's `data/` files can change what the indexes say, but not run code: the tool only reads JSON and Markdown from there, and escapes it before writing the indexes. Links are only written for `https://claude.ai/` addresses.
 
@@ -160,15 +166,40 @@ What else the archive reveals, beyond the conversations themselves:
 - The copies include subagent transcripts and `tool-results` files: full contents of files that were read and full output of commands that were run.
 - **Keeping transcripts forever is itself a trade-off.** With `cleanupPeriodDays` at 36500, a secret pasted into a session also stays in `~/.claude` on your computer indefinitely, not only in the archive.
 - Digests (`digest`) contain your messages (up to 1500 characters each), including anything you pasted. Handing them to a new Claude session to summarise sends that text to the model provider again and records it in the new session's transcript, which is archived too.
+- An export from claude.ai (`export-claude-ai.js`) is the same kind of content as a transcript, in a file in your Downloads folder. Once `import` has filed it, delete the export.
+- `SECRETS.md` never contains a credential, only its first four and last two characters, its length, a fingerprint (the first 12 hex digits of its SHA-256) and the files it is in. That is still enough to tell someone where to look, so it is as private as the rest of the archive.
 - The settings backups the installer writes (`~/.claude/settings.json.bak-<timestamp>`, the newest 3 kept, readable by you only) contain whatever your settings contain, including any `env` tokens.
 
 The archive, indexes, config and log are created readable by you only (permissions 0600 / 0700 on macOS and Linux). An independent review of the code, its findings, and the tests that pin each fix are described in [securityaudit.md](securityaudit.md); run them with `python3 -m unittest discover -s tests`.
 
-## Cloud sessions
+## Sessions on claude.ai
 
-Sessions that ran on claude.ai/code ("Claude Code on the web") live on Anthropic's servers. Nothing on your computer holds them, so this tool cannot archive them, and according to [Anthropic's data usage page](https://code.claude.com/docs/en/data-usage) they follow your account's retention policy (30 days for commercial accounts; 30 days or 5 years for consumer accounts, depending on your training setting). The documented way to bring one to your computer is `claude --teleport <session-id>`, run inside a clean checkout of the same repository; it checks out the session's branch and loads its full conversation into your terminal. The docs do not say whether that writes a local transcript this tool would then pick up, and there is no documented bulk export.
+claude.ai keeps its own copy of two kinds of session:
 
-So that cloud sessions are not forgotten, list them in `data/cloud.json`; they then appear in `INDEX.md` and `SESSIONS.md` under their group, marked `Cloud (claude.ai)`, with a link:
+- **Cloud sessions**, started on [claude.ai/code](https://claude.ai/code) or the mobile app. They run on Anthropic's servers, so no computer of yours has a transcript.
+- **Remote Control sessions**: local sessions you could also reach from claude.ai or your phone. Your computer has the transcript, but only until Claude Code deletes it, and claude.ai's copy can outlast it.
+
+According to [Anthropic's data usage page](https://code.claude.com/docs/en/data-usage), what claude.ai keeps follows your account's retention policy, so don't rely on it lasting. There is no documented export, so this folder includes [`export-claude-ai.js`](export-claude-ai.js), a short script you run yourself in your browser while signed in to claude.ai. It reads the same addresses the claude.ai page loads, with your own sign-in, and downloads every session as compressed files. The tool itself still makes no network requests.
+
+1. Open https://claude.ai/code, open the developer console (Chrome: View > Developer > JavaScript Console), read `export-claude-ai.js`, paste it in and press Enter. Save each file it downloads.
+2. File them into the archive:
+
+   ```sh
+   claude-session-archive import ~/Downloads/claude-ai-sessions-*.jsonl.gz
+   ```
+
+   Each session becomes `all-sessions/cloud/session_<id>.json`. An existing copy is only replaced by one with more events, so importing an older export never loses anything.
+3. Delete the downloaded files.
+
+The index then shows:
+
+- **cloud sessions** under `Cloud · <how it was started> · <repo> (<branch>)`;
+- **recovered sessions**, Remote Control sessions whose local transcript is gone, under `Recovered from claude.ai · Terminal, Remote Control · <repo>`;
+- for a session your computer still has, nothing new in the index; `SESSIONS.md` notes that a claude.ai copy was also saved.
+
+`digest` covers imported sessions too, so they can be summarised like any other; their summaries go in `data/summaries.json` under their `session_<id>`. A claude.ai copy holds the conversation and tool calls as claude.ai recorded them, which may not be everything the local transcript had.
+
+To add details by hand, or to list a cloud session you have not exported, use `data/cloud.json`. Its fields fill in or override what the saved copy says:
 
 ```json
 { "sessions": [
@@ -180,7 +211,26 @@ So that cloud sessions are not forgotten, list them in `data/cloud.json`; they t
 ] }
 ```
 
-Only `title` is required. The Where column shows `Cloud · <started_from> · <repo> (<branch>)` with whatever is filled in. The claude.ai session page shows the repository and branch; `started_from` is free text (Android app, iOS app, Web). Copy `url` from the browser's address bar while the session is open; only `https://claude.ai/` links are accepted. The summary is the only record of the content that lasts unless you also save the transcript: a copy saved as `all-sessions/cloud/session_<id>.json` (the id from its `url`) is linked from its entry in `SESSIONS.md`. There is no documented export; one way is the session's own event log, which the claude.ai page loads from `/v1/code/sessions/session_<id>/events`.
+Only `title` is required. Only `https://claude.ai/` links are accepted.
+
+## Scanning for secrets
+
+```sh
+claude-session-archive secrets          # writes SECRETS.md in the archive
+claude-session-archive secrets --fail   # also exits 1 if anything is found
+```
+
+It reads every transcript, memory note and saved claude.ai copy in the archive and looks for credentials with a recognisable shape: private keys; Anthropic, OpenAI, Google, Stripe (live), npm, GitLab and GitHub tokens; AWS access key ids; Slack tokens and webhooks; database URLs with a password; JSON Web Tokens; and `password = "..."`-style assignments. Obvious placeholders (`your-api-key`, `xxxxxx`, `${VAR}`, `example`, `test`) are skipped.
+
+`SECRETS.md` lists each distinct value once, **masked** (first four and last two characters, and its length), with a fingerprint, how many places it appears and where it was first seen. It never contains the value itself, and the tool never changes a transcript.
+
+For each real credential, **rotate it** with the service that issued it: it is stored in plain text in every copy of the archive and in `~/.claude` on the computer it came from, so deleting it from one file does not make it secret again. For a match that isn't a secret (a test value), add its fingerprint to `data/secrets-ignore.json`:
+
+```json
+{ "ignore": ["3f2a9c1b7d4e"] }
+```
+
+These are pattern matches, not proof: expect some false positives, and do not treat an empty report as a guarantee. A credential with no recognisable shape (a plain password typed into a sentence) will not be found.
 
 ## Uninstall
 

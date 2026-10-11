@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.1.0 (2026-10-11)
+
+- `import FILE...`: files sessions exported from claude.ai (gzip or plain JSON Lines, or the older single-object JSON) into `all-sessions/cloud/session_<id>.json`. Session ids are validated before they become file names; an existing copy is only replaced by one holding more events.
+- `export-claude-ai.js`: a short script you run in your own browser on claude.ai to download every cloud and Remote Control session claude.ai still has.
+- The index builds rows from saved copies: cloud sessions (no `cloud.json` entry needed) and **recovered** Remote Control sessions whose local transcript is gone. A local session whose claude.ai copy was also saved is not listed twice.
+- `digest` covers saved claude.ai sessions.
+- `secrets [--fail]`: scans the archive for credentials with a recognisable shape and writes `SECRETS.md`, with every value masked; `data/secrets-ignore.json` silences fingerprints.
+
 ## 1.0.2 (2026-10-11)
 
 - A cloud session transcript saved as `all-sessions/cloud/session_<id>.json` is linked from its `SESSIONS.md` entry instead of "not archived".

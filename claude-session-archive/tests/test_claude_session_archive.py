@@ -6,6 +6,7 @@ Every test runs the real CLI in a subprocess against a throwaway HOME, Claude co
 folder and archive, so nothing on the machine running the tests is touched.
 """
 import ast
+import gzip
 import json
 import os
 import re
@@ -408,7 +409,7 @@ class SyncTests(Base):
         self.assertIn("Transcript: not archived", full)
         saved = self.e.archive / "all-sessions" / "cloud"
         saved.mkdir(parents=True)
-        (saved / "session_01GoodExample.json").write_text("{}")
+        (saved / "session_01GoodExample.json").write_text(json.dumps({"id": "session_01GoodExample", "events": []}))
         self.sync()
         full = (self.e.archive / "SESSIONS.md").read_text(encoding="utf-8")
         self.assertIn("Transcript: `all-sessions/cloud/session_01GoodExample.json` (a copy saved from claude.ai)", full)
@@ -437,6 +438,130 @@ class SyncTests(Base):
 
     def test_status_reports_runnable_hook(self):
         self.assertIn("installed, runnable", self.e.run("status").stdout)
+
+
+def fake(prefix, n, alphabet="A1b2C3d4E5f6G7h8J9k0"):
+    """A credential-shaped value built at run time, so this file holds nothing that looks real."""
+    return prefix + (alphabet * 20)[:n]
+
+
+def export_line(sid, kind="bridge", title="Recovered work", created="2026-04-01T09:00:00Z", text="please fix the login", origin="claude_code_cli", repo="me/app"):
+    meta = {"title": title, "created_at": created, "last_event_at": "2026-04-02T09:00:00Z", "environment_kind": kind,
+            "config": {"origin": origin}, "external_metadata": {"current_branches": {repo: "main"}}}
+    events = [{"sequence_num": "1", "event_type": "user", "payload": {"message": {"role": "user", "content": text}}},
+              {"sequence_num": "2", "event_type": "assistant",
+               "payload": {"message": {"role": "assistant", "content": [{"type": "text", "text": "Fixed it."}]}}}]
+    return json.dumps({"id": sid, "listing": {"id": "cse_" + sid[8:]}, "metadata": meta, "events": events}) + "\n"
+
+
+class ImportTests(Base):
+    def setUp(self):
+        super().setUp()
+        self.e.write_session("aaaa1111", transcript())
+        self.assertEqual(self.e.install().returncode, 0)
+        self.saved = self.e.archive / "all-sessions" / "cloud"
+
+    def test_import_gzip_jsonl_recovers_lost_sessions_into_the_index(self):
+        export = Path(self.e.tmp.name) / "export.jsonl.gz"
+        with gzip.open(export, "wt", encoding="utf-8") as fh:
+            fh.write(export_line("session_01RecoveredOne1"))
+            fh.write(export_line("session_01CloudOne22222", kind="anthropic_cloud", title="Phone idea", origin="android"))
+            fh.write(json.dumps({"id": "../../etc/passwd", "events": []}) + "\n")
+            fh.write(json.dumps({"id": "session_01NoEvents333"}) + "\n")
+        r = self.e.run("import", str(export))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("2 new, 0 updated, 0 unchanged, 2 skipped", r.stdout)
+        self.assertEqual(sorted(p.name for p in self.saved.iterdir()),
+                         ["session_01CloudOne22222.json", "session_01RecoveredOne1.json"])
+        idx = (self.e.archive / "INDEX.md").read_text(encoding="utf-8")
+        self.assertIn("(3: 1 local, 1 recovered, 1 cloud)", idx)
+        row = next(l for l in idx.splitlines() if "Recovered work" in l)
+        self.assertIn("[Recovered work](https://claude.ai/code/session_01RecoveredOne1)", row)
+        self.assertIn("Recovered from claude.ai · Terminal, Remote Control · me/app", row)
+        self.assertIn("Cloud · Android app", next(l for l in idx.splitlines() if "Phone idea" in l))
+        full = (self.e.archive / "SESSIONS.md").read_text(encoding="utf-8")
+        self.assertIn("Transcript: `all-sessions/cloud/session_01RecoveredOne1.json` (a copy saved from claude.ai)", full)
+        out = Path(self.e.tmp.name) / "digests"
+        self.e.run("digest", str(out))
+        self.assertIn("USER: please fix the login", (out / "session_01RecoveredOne1.txt").read_text())
+
+    def test_import_never_replaces_a_fuller_copy(self):
+        big = Path(self.e.tmp.name) / "big.jsonl"
+        big.write_text(export_line("session_01Keep00000000"))
+        self.e.run("import", str(big))
+        small = json.loads(export_line("session_01Keep00000000"))
+        small["events"] = small["events"][:1]
+        (Path(self.e.tmp.name) / "small.jsonl").write_text(json.dumps(small) + "\n")
+        r = self.e.run("import", str(Path(self.e.tmp.name) / "small.jsonl"))
+        self.assertIn("0 new, 0 updated, 1 unchanged", r.stdout)
+        self.assertEqual(len(json.loads((self.saved / "session_01Keep00000000.json").read_text())["events"]), 2)
+
+    def test_local_remote_control_session_is_not_listed_twice(self):
+        bridge = line(type="bridge-session", bridgeSessionId="cse_01Twice0000000")
+        self.e.write_session("bbbb2222", transcript(title="Here locally", extra=bridge))
+        self.e.run("sync")
+        f = Path(self.e.tmp.name) / "e.jsonl"
+        f.write_text(export_line("session_01Twice0000000", title="Here locally"))
+        self.e.run("import", str(f))
+        idx = (self.e.archive / "INDEX.md").read_text(encoding="utf-8")
+        self.assertEqual(idx.count("Here locally"), 1)
+        self.assertIn("Also saved from claude.ai: `all-sessions/cloud/session_01Twice0000000.json`",
+                      (self.e.archive / "SESSIONS.md").read_text(encoding="utf-8"))
+
+
+class SecretsTests(Base):
+    def setUp(self):
+        super().setUp()
+        self.keys = {
+            "Anthropic API key": fake("sk-ant-api03-", 90),
+            "AWS access key id": "AKIA" + "Q7RT2MZP4KD9WX3N",
+            "GitHub token": fake("ghp_", 36),
+            "Database URL with password": "postgres://admin:" + fake("pw", 14) + "@db.internal:5432/app",
+        }
+        pasted = " and ".join(self.keys.values())
+        self.e.write_session("aaaa1111", transcript(prompt="use these: " + pasted + ' and password="' + fake("Pq", 12) + '"'))
+        self.e.write_session("cccc3333", transcript(prompt="again " + self.keys["GitHub token"]))
+        self.e.write_session("dddd4444", transcript(prompt='api_key="your-api-key-here" and AKIAXXXXXXXXXXXXXXXX'))
+        self.assertEqual(self.e.install().returncode, 0)
+
+    def test_finds_each_kind_and_never_writes_the_value(self):
+        r = self.e.run("secrets")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        report = (self.e.archive / "SECRETS.md").read_text(encoding="utf-8")
+        for kind in list(self.keys) + ["Password or secret assignment"]:
+            self.assertIn(f"| {kind} |", report)
+        for value in self.keys.values():
+            self.assertNotIn(value, report)
+            self.assertNotIn(value, r.stdout + r.stderr)
+        gh = next(l for l in report.splitlines() if "| GitHub token |" in l)
+        self.assertIn("| 2 |", gh, "the same token in two sessions is one value seen twice")
+        # placeholders are not reported: one real AWS key, one real password assignment
+        self.assertEqual(report.count("| AWS access key id |"), 1)
+        self.assertEqual(report.count("| Password or secret assignment |"), 1)
+        self.assertIn("**5 distinct value(s)** found", report)
+
+    def test_hyphenated_words_are_not_keys(self):
+        self.e.write_session("ffff6666", transcript(prompt="see risk-assessment-for-third-party-vendor-onboarding-checklist "
+                                                           "and task-scheduler-configuration-for-nightly-reports-runs"))
+        self.e.run("sync")
+        self.e.run("secrets")
+        self.assertNotIn("OpenAI API key", (self.e.archive / "SECRETS.md").read_text(encoding="utf-8"))
+
+    def test_ignore_list_and_fail_flag(self):
+        report = (lambda: (self.e.archive / "SECRETS.md").read_text(encoding="utf-8"))
+        self.e.run("secrets")
+        fp = re.search(r"\| GitHub token \| `[^`]+` \| `([0-9a-f]{12})`", report()).group(1)
+        (self.e.archive / "data" / "secrets-ignore.json").write_text(json.dumps({"ignore": [fp]}))
+        r = self.e.run("secrets", "--fail")
+        self.assertEqual(r.returncode, 1)
+        self.assertNotIn("| GitHub token |", report())
+
+    def test_long_lines_stay_fast(self):
+        self.e.write_session("eeee5555", transcript(prompt="eyJ" + "a" * 400000 + " sk-" + "-" * 300000 + " AKIA" + "Z" * 200000))
+        self.e.run("sync")
+        t = time.time()
+        self.assertEqual(self.e.run("secrets").returncode, 0)
+        self.assertLess(time.time() - t, 20)
 
 
 class SourceTests(unittest.TestCase):

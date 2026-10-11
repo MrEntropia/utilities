@@ -12,8 +12,8 @@ Date: 2026-10-11. Scope: `claude_session_archive.py`, `install.sh`, `install.ps1
 
 | Check | Result |
 |---|---|
-| Test suite, Python 3.9.6 (macOS system Python) | 37 tests, all pass |
-| Test suite, Python 3.13 (Homebrew) | 37 tests, all pass |
+| Test suite, Python 3.9.6 (macOS system Python) | 44 tests, all pass |
+| Test suite, Python 3.13 (Homebrew) | 44 tests, all pass |
 | Python 3.8 syntax (`ast.parse(feature_version=(3, 8))`) | pass |
 | `sh -n install.sh` | pass |
 | Hook format accepted by Claude Code 2.1.296 (a real headless session with an exec-form `SessionStart` hook, both blocking and `async`) | both hooks ran |
@@ -87,6 +87,25 @@ The index gained a column saying which computer and app ran each session, a clau
 | Computer name in `all-sessions/computers/*.json` | markup in the name; a corrupt file breaking the sync | escaped like every other string; an unreadable file is skipped and logged | `test_sessions_from_another_computer_name_it` |
 
 The tool still opens no network connection: links are written into the Markdown, never fetched.
+
+### Added in 1.1.0: import from claude.ai, and a secrets scan
+
+Both handle the most sensitive data the tool touches: a whole export of claude.ai sessions, and the credentials inside transcripts. Checked against two threats: an export file turning into a write outside the archive or a loss of data, and the secrets report becoming a leak itself.
+
+| Input or output | Risk | Handling | Test |
+|---|---|---|---|
+| Session `id` in an export file | becomes a file name: `../../` path traversal | must match `session_` (or `cse_`) plus 8 to 64 letters and digits, otherwise skipped and counted | `test_import_gzip_jsonl_recovers_lost_sessions_into_the_index` |
+| Re-importing an older export | a shorter copy replacing a fuller one | replaced only when the new copy has more events | `test_import_never_replaces_a_fuller_copy` |
+| A symlink planted at the destination | writing through it | skipped | (same handling as the sync; reviewed) |
+| A session both local and saved | listed twice, double counted | the saved copy attaches to the local row | `test_local_remote_control_session_is_not_listed_twice` |
+| Titles, repositories, first requests from claude.ai | markup in the indexes | escaped like every other string; links built only from validated ids | (same functions as H1) |
+| `SECRETS.md` and the command's output | printing the credentials it found | only `mask()` output (four leading and two trailing characters, length) and a 12-digit SHA-256 fingerprint are written; tested against the full values in both the report and stdout/stderr | `test_finds_each_kind_and_never_writes_the_value` |
+| Placeholder values, hyphenated words | noise that trains people to ignore the report | placeholders skipped; OpenAI-shaped matches must look random and not follow a word character | `test_finds_each_kind_and_never_writes_the_value`, `test_hyphenated_words_are_not_keys` |
+| Megabyte-long transcript lines | catastrophic regex backtracking | every quantifier bounded; each pattern only runs on lines containing its literal prefix | `test_long_lines_stay_fast` |
+
+Mutation check, each reverted alone: masking (red), the placeholder filter (red, after a first version of the test was found unable to fail and was rewritten), the id check (red), the never-shrink rule (red), the local de-duplication (red), the word-boundary and randomness check (red).
+
+On the author's archive (2,475 files): 37 distinct values found in about 2 minutes, after the false-positive fixes removed 7 (six hyphenated words read as OpenAI keys, and one well-known example password) and the duplicate counting was fixed. `export-claude-ai.js` is not covered by the Python tests; the same requests, run as an inline script, exported 183 sessions from a real account, but the published file itself has not been run end to end.
 
 ## Confirmed properties (checked, unchanged)
 
