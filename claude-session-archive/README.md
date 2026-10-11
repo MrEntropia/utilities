@@ -180,7 +180,7 @@ So that cloud sessions are not forgotten, list them in `data/cloud.json`; they t
 ] }
 ```
 
-Only `title` is required. The Where column shows `Cloud · <started_from> · <repo> (<branch>)` with whatever is filled in. The claude.ai session page shows the repository and branch; `started_from` is free text (Android app, iOS app, Web). Copy `url` from the browser's address bar while the session is open; only `https://claude.ai/` links are accepted. The summary is the only record of the content that lasts, so write it (or ask the cloud session to write it) before the session expires.
+Only `title` is required. The Where column shows `Cloud · <started_from> · <repo> (<branch>)` with whatever is filled in. The claude.ai session page shows the repository and branch; `started_from` is free text (Android app, iOS app, Web). Copy `url` from the browser's address bar while the session is open; only `https://claude.ai/` links are accepted. The summary is the only record of the content that lasts unless you also save the transcript: a copy saved as `all-sessions/cloud/session_<id>.json` (the id from its `url`) is linked from its entry in `SESSIONS.md`. There is no documented export; one way is the session's own event log, which the claude.ai page loads from `/v1/code/sessions/session_<id>/events`.
 
 ## Uninstall
 

@@ -384,7 +384,7 @@ class SyncTests(Base):
 
     def test_cloud_sessions_listed_and_bad_links_dropped(self):
         (self.e.archive / "data" / "cloud.json").write_text(json.dumps({"sessions": [
-            {"title": "Cloud idea", "url": "https://claude.ai/code/session_01Good", "date": "2026-09-30",
+            {"title": "Cloud idea", "url": "https://claude.ai/code/session_01GoodExample", "date": "2026-09-30",
              "group": "Ideas", "summary": "Explored it. More.", "kind": "Research", "repo": "me/repo",
              "branch": "feat/x <b>", "started_from": "Android app", "last": "2026-10-02",
              "first_request": "Look into <this>"},
@@ -396,7 +396,7 @@ class SyncTests(Base):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         idx = (self.e.archive / "INDEX.md").read_text(encoding="utf-8")
         self.assertIn("### Ideas (1)", idx)
-        self.assertIn("| 2026-09-30 | Research | [Cloud idea](https://claude.ai/code/session_01Good) "
+        self.assertIn("| 2026-09-30 | Research | [Cloud idea](https://claude.ai/code/session_01GoodExample) "
                       "| Cloud · Android app · me/repo (feat/x &lt;b&gt;) | Explored it | `cloud` |", idx)
         forged = next(l for l in idx.splitlines() if "| Forged |" in l)
         self.assertIn("| Cloud |", forged, "an entry with no details still says Cloud")
@@ -406,6 +406,13 @@ class SyncTests(Base):
         self.assertIn("By type: 1 research.", idx)
         full = (self.e.archive / "SESSIONS.md").read_text(encoding="utf-8")
         self.assertIn("Transcript: not archived", full)
+        saved = self.e.archive / "all-sessions" / "cloud"
+        saved.mkdir(parents=True)
+        (saved / "session_01GoodExample.json").write_text("{}")
+        self.sync()
+        full = (self.e.archive / "SESSIONS.md").read_text(encoding="utf-8")
+        self.assertIn("Transcript: `all-sessions/cloud/session_01GoodExample.json` (a copy saved from claude.ai)", full)
+        self.assertEqual(full.count("a copy saved from claude.ai"), 1, "only the entry whose id matches")
         self.assertIn("2026-09-30 to 2026-10-02 · repo · **Research**", full)
         self.assertIn("First request: _Look into &lt;this&gt;_", full)
 
