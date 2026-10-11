@@ -14,3 +14,5 @@ Thumbs.db
 # Editor noise
 .vscode/settings.json
 *.log
+__pycache__/
+*.pyc
