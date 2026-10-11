@@ -173,12 +173,14 @@ So that cloud sessions are not forgotten, list them in `data/cloud.json`; they t
 ```json
 { "sessions": [
     { "title": "Pricing page ideas", "url": "https://claude.ai/code/session_01ExampleOnly",
-      "date": "2026-09-30", "group": "Marketing", "repo": "you/your-repo",
+      "date": "2026-09-30", "last": "2026-10-02", "group": "Marketing",
+      "started_from": "Android app", "repo": "you/your-repo", "branch": "claude/pricing-ideas",
+      "first_request": "What should the pricing page say?",
       "summary": "What was asked, what was done, how it ended.", "keep": "One thing worth remembering.", "kind": "Research" }
 ] }
 ```
 
-Only `title` is required. Copy `url` from the browser's address bar while the session is open; only `https://claude.ai/` links are accepted. The summary is the only record of the content that lasts, so write it (or ask the cloud session to write it) before the session expires.
+Only `title` is required. The Where column shows `Cloud · <started_from> · <repo> (<branch>)` with whatever is filled in. The claude.ai session page shows the repository and branch; `started_from` is free text (Android app, iOS app, Web). Copy `url` from the browser's address bar while the session is open; only `https://claude.ai/` links are accepted. The summary is the only record of the content that lasts, so write it (or ask the cloud session to write it) before the session expires.
 
 ## Uninstall
 
