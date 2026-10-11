@@ -8,6 +8,7 @@ folder and archive, so nothing on the machine running the tests is touched.
 import ast
 import json
 import os
+import re
 import socket
 import stat
 import subprocess
@@ -343,6 +344,63 @@ class SyncTests(Base):
         r = self.sync()
         self.assertEqual(r.returncode, 1)
         self.assertIn("not reachable", r.stdout)
+
+    def test_where_shows_computer_app_and_remote_control_link(self):
+        bridge = line(type="bridge-session", entrypoint="claude-desktop", bridgeSessionId="cse_01AbCdEf234567")
+        self.e.write_session("ffff6666", transcript(title="Desk [work]", extra=bridge))
+        self.sync()
+        idx = (self.e.archive / "INDEX.md").read_text(encoding="utf-8")
+        row = next(l for l in idx.splitlines() if "ffff6666" in l)
+        self.assertIn(f"{socket.gethostname()} · Desktop app, Remote Control", row)
+        self.assertIn("[Desk \\[work\\]](https://claude.ai/code/session_01AbCdEf234567)", row)
+        plain = next(l for l in idx.splitlines() if "aaaa1111" in l)
+        self.assertNotIn("](", plain, "a session without Remote Control must not get a link")
+        self.assertIn("On claude.ai: https://claude.ai/code/session_01AbCdEf234567",
+                      (self.e.archive / "SESSIONS.md").read_text(encoding="utf-8"))
+
+    def test_malformed_remote_control_id_not_linked(self):
+        bad = line(type="bridge-session", bridgeSessionId="cse_x)](https://evil.example")
+        self.e.write_session("abab7777", transcript(extra=bad))
+        self.sync()
+        self.assertNotIn("evil.example", (self.e.archive / "INDEX.md").read_text(encoding="utf-8"))
+
+    def test_sessions_from_another_computer_name_it(self):
+        projects = self.e.archive / "all-sessions" / "projects" / "-other-proj"
+        projects.mkdir(parents=True)
+        (projects / "bcbc8888.jsonl").write_text(transcript(title="Elsewhere"), encoding="utf-8")
+        computers = self.e.archive / "all-sessions" / "computers"
+        (computers / "other-pc.json").write_text(json.dumps(
+            {"computer": "other-pc <b>", "sessions": ["-other-proj/bcbc8888.jsonl"]}))
+        (computers / "broken.json").write_text("{not json")
+        r = self.sync()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        idx = (self.e.archive / "INDEX.md").read_text(encoding="utf-8")
+        row = next(l for l in idx.splitlines() if "bcbc8888" in l)
+        self.assertIn("other-pc &lt;b&gt; · unknown app", row)  # the test transcript has no entrypoint
+        own_name = re.sub(r"[^A-Za-z0-9._-]", "_", socket.gethostname())[:64] + ".json"
+        own = json.loads((computers / own_name).read_text())
+        self.assertIn("-work-proj/aaaa1111.jsonl", own["sessions"])
+        self.assertNotIn("-other-proj/bcbc8888.jsonl", own["sessions"], "a computer lists only its own sessions")
+
+    def test_cloud_sessions_listed_and_bad_links_dropped(self):
+        (self.e.archive / "data" / "cloud.json").write_text(json.dumps({"sessions": [
+            {"title": "Cloud idea", "url": "https://claude.ai/code/session_01Good", "date": "2026-09-30",
+             "group": "Ideas", "summary": "Explored it. More.", "kind": "Research", "repo": "me/repo"},
+            {"title": "Forged", "url": "https://claude.ai/x)[evil](https://evil.example"},
+            {"title": "Script", "url": "javascript:alert(1)"},
+            {"url": "https://claude.ai/code/session_01NoTitle"},
+        ]}))
+        r = self.sync()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        idx = (self.e.archive / "INDEX.md").read_text(encoding="utf-8")
+        self.assertIn("### Ideas (1)", idx)
+        self.assertIn("| 2026-09-30 | Research | [Cloud idea](https://claude.ai/code/session_01Good) "
+                      "| Cloud (claude.ai) | Explored it | `cloud` |", idx)
+        self.assertIn("## All sessions (4: 1 local, 3 cloud)", idx)
+        self.assertNotIn("evil.example", idx)
+        self.assertNotIn("javascript:", idx)
+        self.assertIn("By type: 1 research.", idx)
+        self.assertIn("Transcript: not archived", (self.e.archive / "SESSIONS.md").read_text(encoding="utf-8"))
 
     def test_last_sync_names_computer(self):
         self.assertIn(socket.gethostname(), (self.e.archive / "LAST-SYNC.txt").read_text())

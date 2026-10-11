@@ -6,18 +6,19 @@ Date: 2026-10-11. Scope: `claude_session_archive.py`, `install.sh`, `install.ps1
 
 1. **Independent adversarial review** of the pre-release code (read-only), covering: what can leave the machine; path traversal and symlinks in the copy; shell and command injection; file permissions; safety of editing `~/.claude/settings.json`; correctness under concurrency, offline drives and malformed input; Python 3.8 compatibility; Windows and POSIX-shell specifics. The reviewer reproduced each finding against a throwaway home folder and never touched a real configuration.
 2. **Every finding fixed**, then pinned by an automated test in [`tests/test_claude_session_archive.py`](tests/test_claude_session_archive.py). Each test runs the real command-line tool in a subprocess against a throwaway home folder, Claude config folder and archive.
-3. **Mutation check.** To show the tests guard something, three fixes were reverted in a scratch copy and the suite re-run. Each revert turned tests red (results below), and the restored code is green.
+3. **Mutation check.** To show the tests guard something, eight fixes and checks were reverted one at a time in a scratch copy and the suite re-run. Each revert turned tests red (results below), and the restored code is green.
 
 ## Results
 
 | Check | Result |
 |---|---|
-| Test suite, Python 3.9.6 (macOS system Python) | 33 tests, all pass |
-| Test suite, Python 3.13 (Homebrew) | 33 tests, all pass |
+| Test suite, Python 3.9.6 (macOS system Python) | 37 tests, all pass |
+| Test suite, Python 3.13 (Homebrew) | 37 tests, all pass |
 | Python 3.8 syntax (`ast.parse(feature_version=(3, 8))`) | pass |
 | `sh -n install.sh` | pass |
 | Hook format accepted by Claude Code 2.1.296 (a real headless session with an exec-form `SessionStart` hook, both blocking and `async`) | both hooks ran |
 | End-to-end install, sync, re-install and uninstall on macOS (author's machine, real archive of 59 sessions) | pass |
+| Where-it-ran column on the same archive (59 local sessions: 55 Terminal with Remote Control, 2 Desktop app, 1 Terminal, 1 SDK; 6 cloud sessions from `data/cloud.json`) | pass |
 | **Windows (`install.ps1`, `.cmd` shim, PATH edit)** | **not executed**: reviewed only, no Windows machine was available. Treat as untested until run there |
 | Linux | not executed; same code paths as macOS except the installer's package-manager branch |
 
@@ -29,6 +30,10 @@ Mutation check (fix reverted, suite re-run):
 | "Only replace an archived transcript that has grown" | `test_smaller_local_transcript_never_replaces_archive_copy`, `test_changed_memory_note_kept_beside_not_over` |
 | Refusing unsupported `settings.json` shapes before changing anything | `test_bad_settings_shapes_refused_before_any_change` (2 cases) |
 | Pruning only the backups this tool created | `test_backups_capped` |
+| Accepting only `https://claude.ai/` links from `data/cloud.json` | `test_cloud_sessions_listed_and_bad_links_dropped` |
+| Accepting only a well-formed Remote Control id (`cse_` plus letters and digits) | `test_malformed_remote_control_id_not_linked` |
+| Escaping `[` `]` in a linked title | `test_where_shows_computer_app_and_remote_control_link` |
+| Each computer listing only its own sessions (not the whole archive) | `test_sessions_from_another_computer_name_it` |
 
 ## Findings and fixes
 
@@ -68,6 +73,19 @@ Severity is as the reviewer rated it. "Test" names the test that now pins the fi
 | Uninstall could delete a `~/.local/bin/claude-session-archive` belonging to something else. | Only removed if it is this tool's shim. | `test_foreign_shim_left_alone` |
 | `install.sh`: `--uninstall` only as the first argument; fish shell told PATH was added when it was not; `cd` not `CDPATH`-safe. | All fixed. | manual review |
 | `digest --cap 0` returned everything. | Minimum 1000. | `test_digest_and_cap` |
+
+### Added after the review: where each session ran
+
+The index gained a column saying which computer and app ran each session, a claude.ai link for Remote Control sessions, and a hand-maintained list of cloud sessions (`data/cloud.json`). This adds new text and new links to the generated files, so it was checked against the same threat as H1 (anything written into the archive turning into markup or a misleading link):
+
+| Input | Risk | Handling | Test |
+|---|---|---|---|
+| `url` in `data/cloud.json` | a link to another site, `javascript:`, or text that closes the Markdown link and opens a new one | linked only if the whole value matches `https://claude.ai/` followed by URL-safe characters with no `)`, `]` or spaces; otherwise shown unlinked and logged | `test_cloud_sessions_listed_and_bad_links_dropped` |
+| `bridgeSessionId` in a transcript | same, via a crafted transcript | linked only if it is exactly `cse_` plus 8 to 64 letters or digits; the link is built by the tool, not copied | `test_malformed_remote_control_id_not_linked` |
+| Session title used as link text | `]` ending the link label early | `[` and `]` escaped, on top of the H1 escaping | `test_where_shows_computer_app_and_remote_control_link` |
+| Computer name in `all-sessions/computers/*.json` | markup in the name; a corrupt file breaking the sync | escaped like every other string; an unreadable file is skipped and logged | `test_sessions_from_another_computer_name_it` |
+
+The tool still opens no network connection: links are written into the Markdown, never fetched.
 
 ## Confirmed properties (checked, unchanged)
 

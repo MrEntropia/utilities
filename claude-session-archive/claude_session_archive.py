@@ -27,6 +27,7 @@ from datetime import datetime
 from pathlib import Path
 
 VERSION = "1.0.0"
+CACHE_VERSION = 2  # bump when scan_session() returns new fields, so cached rows are re-read
 STALE_SECONDS = 20 * 3600
 LOCK_STALE_SECONDS = 2 * 3600
 RETENTION_DAYS = 36500
@@ -153,6 +154,15 @@ def copy_additive(src, archive_root, host):
     return copied
 
 
+def write_computer_manifest(src, archive_root, host):
+    """Record which sessions this computer holds, in a file only this computer writes
+    (all-sessions/computers/<host>.json), so the index can say where each session ran."""
+    keys = sorted(p.relative_to(src).as_posix() for p in src.glob("*/*.jsonl") if not p.is_symlink())
+    path = archive_root / "computers" / f"{safe_name(host)}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_atomic(path, json.dumps({"computer": host, "sessions": keys}, indent=1) + "\n")
+
+
 def safe_name(text):
     return re.sub(r"[^A-Za-z0-9._-]", "_", text)[:64] or "host"
 
@@ -184,7 +194,10 @@ def cmd_sync(args):
     try:
         STAMP.touch()  # at the start, so session starts during a long sync do not pile up
         host = socket.gethostname()
-        copied = copy_additive(PROJECTS, archive / "all-sessions", host) if PROJECTS.is_dir() else 0
+        copied = 0
+        if PROJECTS.is_dir():
+            copied = copy_additive(PROJECTS, archive / "all-sessions", host)
+            write_computer_manifest(PROJECTS, archive / "all-sessions", host)
         count = build_index(archive)
         write_atomic(archive / "LAST-SYNC.txt", f"{datetime.now():%Y-%m-%d %H:%M} {host}\n")
         log(f"ok: {copied} file(s) copied, {count} sessions indexed")
@@ -199,6 +212,20 @@ def cmd_sync(args):
 # ---------------------------------------------------------------- index
 
 UNGROUPED = "Ungrouped"
+
+# Where a session ran, from the transcript's "entrypoint". Anything else is shown as written.
+SURFACES = {
+    "cli": "Terminal",
+    "claude-desktop": "Desktop app",
+    "claude-vscode": "VS Code",
+    "sdk-cli": "SDK / headless",
+    "sdk-ts": "SDK",
+    "sdk-py": "SDK",
+}
+# A Remote Control session records the id of its claude.ai counterpart; cse_X is session_X there.
+BRIDGE_ID = re.compile(r"cse_[A-Za-z0-9]{8,64}")
+# Links accepted from data/cloud.json: claude.ai only, and no characters that end a Markdown link.
+CLOUD_URL = re.compile(r"https://claude\.ai/[A-Za-z0-9_./?=&%-]{1,200}")
 
 CURATED_TEMPLATE = """## Curated projects
 
@@ -228,7 +255,7 @@ def first_prompt(msg):
 
 
 def scan_session(path, src):
-    title = ai_title = cwd = prompt = None
+    title = ai_title = cwd = prompt = entry = bridge = None
     first_ts = last_ts = None
     with open(path, encoding="utf-8", errors="replace") as fh:
         for line in fh:
@@ -248,6 +275,11 @@ def scan_session(path, src):
                 last_ts = ts
             if not cwd and isinstance(rec.get("cwd"), str):
                 cwd = rec["cwd"]
+            if not entry and isinstance(rec.get("entrypoint"), str):
+                entry = rec["entrypoint"]
+            b = rec.get("bridgeSessionId")
+            if not bridge and isinstance(b, str) and BRIDGE_ID.fullmatch(b):
+                bridge = b
             if prompt is None and rec.get("type") == "user" and isinstance(rec.get("message"), dict):
                 prompt = first_prompt(rec["message"])
     if not first_ts:
@@ -261,6 +293,8 @@ def scan_session(path, src):
         "last": (last_ts or first_ts)[:10],
         "prompt": (prompt or "")[:160],
         "file": path.relative_to(src).as_posix(),
+        "entrypoint": entry or "",
+        "bridge": bridge or "",
     }
 
 
@@ -268,7 +302,7 @@ def scan_all(src):
     """Session rows for every transcript, re-reading only files whose size or mtime changed."""
     try:
         cache = json.loads(CACHE.read_text(encoding="utf-8"))
-        if not isinstance(cache, dict) or cache.get("src") != str(src):
+        if not isinstance(cache, dict) or cache.get("src") != str(src) or cache.get("v") != CACHE_VERSION:
             cache = {}
     except (OSError, ValueError):
         cache = {}
@@ -288,7 +322,7 @@ def scan_all(src):
             rows.append(dict(row))
     try:
         CONF_DIR.mkdir(parents=True, exist_ok=True)
-        write_atomic(CACHE, json.dumps({"src": str(src), "rows": new}))
+        write_atomic(CACHE, json.dumps({"v": CACHE_VERSION, "src": str(src), "rows": new}))
     except OSError:
         pass
     return rows
@@ -330,12 +364,76 @@ def load_summaries(data_dir):
     return out
 
 
+def load_computers(root):
+    """{session file key: [computer, ...]} from the manifests each computer writes for itself."""
+    seen = {}
+    for path in sorted((root / "computers").glob("*.json")):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            host, keys = data["computer"], data["sessions"]
+            if not isinstance(host, str) or not isinstance(keys, list):
+                raise ValueError("wrong shape")
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            log(f"skip {path}: {exc}")
+            continue
+        for k in keys:
+            if isinstance(k, str):
+                seen.setdefault(k, []).append(host)
+    return seen
+
+
+def load_cloud(data_dir):
+    """Cloud sessions (claude.ai/code) listed by hand in data/cloud.json. Their transcripts are
+    not on any computer, so this is how they get into the index at all."""
+    raw = read_data(data_dir / "cloud.json", "cloud sessions").get("sessions", [])
+    rows = []
+    for i, v in enumerate(raw if isinstance(raw, list) else []):
+        if not isinstance(v, dict) or not isinstance(v.get("title"), str):
+            log(f"cloud.json: entry {i} has no title; ignored")
+            continue
+        url = v.get("url") if isinstance(v.get("url"), str) else ""
+        if url and not CLOUD_URL.fullmatch(url):
+            log(f"cloud.json: entry {i} url is not a claude.ai link; shown without it")
+            url = ""
+        date = v.get("date") if isinstance(v.get("date"), str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", v["date"]) else ""
+        rows.append({
+            "id": "", "cloud": True, "url": url, "title": v["title"], "custom_title": None,
+            "start": date, "last": date, "cwd": v.get("repo") if isinstance(v.get("repo"), str) else "",
+            "prompt": "", "file": "",
+            "group_hint": v.get("group") if isinstance(v.get("group"), str) else "",
+            "summary": {k: v[k] for k in ("summary", "keep", "kind") if isinstance(v.get(k), str)},
+        })
+    return rows
+
+
+def link(label, url):
+    label = clean(label).replace("[", "\\[").replace("]", "\\]")
+    return f"[{label}]({url})" if url else label
+
+
+def session_url(row):
+    if row.get("cloud"):
+        return row["url"]
+    return f"https://claude.ai/code/session_{row['bridge'][4:]}" if row.get("bridge") else ""
+
+
+def where(row, computers):
+    if row.get("cloud"):
+        return "Cloud (claude.ai)"
+    surface = SURFACES.get(row.get("entrypoint", ""), row.get("entrypoint", "")) or "unknown app"
+    hosts = computers.get(row["file"]) or ["computer not recorded"]
+    rc = ", Remote Control" if row.get("bridge") else ""
+    return clean(f"{' + '.join(hosts)} · {surface}{rc}")
+
+
 def group_of(row, by_prefix):
     # A title you set yourself (/rename "Marketing: launch post") wins over groups.json.
     head, sep, rest = (row["custom_title"] or "").partition(": ")
     if sep and rest.strip() and 0 < len(head) <= 40:
         row["title"] = rest
         return head
+    if row.get("cloud"):
+        return row["group_hint"] or UNGROUPED
     for prefix, name in by_prefix.items():
         if row["id"].startswith(prefix):
             return name
@@ -360,21 +458,30 @@ def build_index(archive):
     curated = curated_path.read_text(encoding="utf-8-sig")
 
     by_prefix = {p: name for name, ids in groups.items() for p in ids}
+    computers = load_computers(archive / "all-sessions")
     rows = scan_all(src) if src.is_dir() else []
+    local_count = len(rows)
+    cloud = load_cloud(data)
+    rows += cloud
     for r in rows:
         r["group"] = group_of(r, by_prefix)
     rows.sort(key=lambda r: r["start"], reverse=True)
     names = list(groups) + sorted({r["group"] for r in rows} - set(groups) - {UNGROUPED}) + [UNGROUPED]
-    missing = sum(1 for r in rows if r["id"] not in summaries)
+    missing = sum(1 for r in rows if not r.get("cloud") and r["id"] not in summaries)
     stamp = f"{datetime.now():%Y-%m-%d %H:%M}"
+    counts = f"{local_count} local" + (f", {len(cloud)} cloud" if cloud else "")
+
+    def summary_of(r):
+        return r["summary"] if r.get("cloud") else summaries.get(r["id"], {})
 
     # SESSIONS.md: every session in full.
     full = [
         "# All Claude Code sessions", "",
-        f"Generated {stamp} from `all-sessions/projects` ({len(rows)} sessions, all computers). Do not edit: rebuilt on every sync.", "",
-        "Resume one from a terminal in its project folder: `claude --resume <id>`.",
+        f"Generated {stamp} from `all-sessions/projects` and `data/cloud.json` ({counts}). Do not edit: rebuilt on every sync.", "",
+        "Resume a local one from a terminal in its project folder: `claude --resume <id>`.",
         "Groups come from a `Group: ` prefix on a title you set with /rename, or from `data/groups.json`.",
-        f"Summaries and types come from `data/summaries.json`; {missing} session(s) have none yet.", "",
+        f"Summaries and types come from `data/summaries.json`; {missing} session(s) have none yet.",
+        "Cloud sessions (claude.ai/code) are listed by hand in `data/cloud.json`; their transcripts are not archived.", "",
     ]
     for name in names:
         group_rows = [r for r in rows if r["group"] == name]
@@ -383,23 +490,31 @@ def build_index(archive):
         full += [f"## {clean(name)} ({len(group_rows)})", ""]
         for r in group_rows:
             proj = clean(os.path.basename(r["cwd"].replace("\\", "/")) or r["cwd"])
-            dates = r["start"] if r["start"] == r["last"] else f"{r['start']} to {r['last']}"
-            s = summaries.get(r["id"], {})
+            dates = (r["start"] if r["start"] == r["last"] else f"{r['start']} to {r['last']}") or "date unknown"
+            s = summary_of(r)
             kind = f" · **{clean(s['kind'])}**" if s.get("kind") else ""
-            full += [f"### {clean(r['title'])}", "", f"{dates} · {proj}{kind} · `{clean(r['id'])}`", ""]
+            ident = "" if r.get("cloud") else f" · `{clean(r['id'])}`"
+            full += [f"### {clean(r['title'])}", "", f"{dates} · {proj or 'no project'}{kind}{ident}", "",
+                     f"Ran on: {where(r, computers)}", ""]
+            url = session_url(r)
+            if url:
+                full += [f"On claude.ai: {url}", ""]
             if s.get("summary"):
                 full += [clean(s["summary"]), ""]
             if s.get("keep"):
                 full += [f"**Keep:** {clean(s['keep'])}", ""]
             if r["prompt"]:
                 full += [f"First request: _{clean(r['prompt'])}_", ""]
-            full += [f"Transcript: `all-sessions/projects/{clean(r['file'])}`", ""]
+            if r.get("cloud"):
+                full += ["Transcript: not archived (stored on claude.ai only)", ""]
+            else:
+                full += [f"Transcript: `all-sessions/projects/{clean(r['file'])}`", ""]
     write_atomic(archive / "SESSIONS.md", "\n".join(full))
 
     # INDEX.md: fully generated, so a rewrite can never lose anything hand-written.
     kinds = {}
     for r in rows:
-        k = summaries.get(r["id"], {}).get("kind")
+        k = summary_of(r).get("kind")
         if k:
             kinds[k] = kinds.get(k, 0) + 1
     idx = [
@@ -409,9 +524,11 @@ def build_index(archive):
         "| Every session, one line each by group, with its type | this file |",
         "| Every session in full: summary, Keep note, first request, transcript path | [`SESSIONS.md`](SESSIONS.md) |",
         "| Groups, summaries and types | `data/groups.json`, `data/summaries.json` |",
+        "| Cloud sessions (claude.ai/code), which have no transcript here | `data/cloud.json` |",
         "| Your notes on curated projects (shown at the end of this file) | `data/curated.md` |",
         "| Raw transcripts and project memory, from every computer | `all-sessions/` |", "",
-        f"## All sessions ({len(rows)})", "",
+        "A linked session title opens it on claude.ai: a cloud session, or a local one that had Remote Control on.", "",
+        f"## All sessions ({len(rows)}: {counts})", "",
     ]
     if kinds:
         tally = ", ".join(f"{n} {clean(k).lower()}" for k, n in sorted(kinds.items(), key=lambda kv: -kv[1]))
@@ -420,11 +537,14 @@ def build_index(archive):
         group_rows = [r for r in rows if r["group"] == name]
         if not group_rows:
             continue
-        idx += [f"### {clean(name)} ({len(group_rows)})", "", "| Date | Type | Session | What it was | Id |", "|---|---|---|---|---|"]
+        idx += [f"### {clean(name)} ({len(group_rows)})", "",
+                "| Date | Type | Session | Where | What it was | Id |", "|---|---|---|---|---|---|"]
         for r in group_rows:
-            s = summaries.get(r["id"], {})
+            s = summary_of(r)
             what = first_sentence(s.get("summary") or r["prompt"])
-            idx.append(f"| {r['start']} | {clean(s.get('kind', ''))} | {clean(r['title'])} | {what} | `{clean(r['id'][:8])}` |")
+            ident = "cloud" if r.get("cloud") else clean(r["id"][:8])
+            idx.append(f"| {r['start']} | {clean(s.get('kind', ''))} | {link(r['title'], session_url(r))} "
+                       f"| {where(r, computers)} | {what} | `{ident}` |")
         idx.append("")
     idx += ["---", "", curated.rstrip(), ""]
     write_atomic(archive / "INDEX.md", "\n".join(idx))
