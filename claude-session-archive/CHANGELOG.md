@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.1 (2026-10-11)
+
+- Cloud sessions in `data/cloud.json` take `started_from`, `branch`, `last` and `first_request`; the Where column shows `Cloud · <started_from> · <repo> (<branch>)` instead of only `Cloud (claude.ai)`, and `SESSIONS.md` shows the date range and first request.
+
 ## 1.0.0 (2026-10-11)
 
 - `install`: sets `cleanupPeriodDays` to 36500 so Claude Code stops deleting transcripts after 30 days, adds an exec-form async `SessionStart` hook (no shell), installs a copy of the script and a `claude-session-archive` command, backs up `settings.json` first; re-running it replaces its own hook instead of adding another.

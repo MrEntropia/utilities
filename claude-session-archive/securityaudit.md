@@ -83,6 +83,7 @@ The index gained a column saying which computer and app ran each session, a clau
 | `url` in `data/cloud.json` | a link to another site, `javascript:`, or text that closes the Markdown link and opens a new one | linked only if the whole value matches `https://claude.ai/` followed by URL-safe characters with no `)`, `]` or spaces; otherwise shown unlinked and logged | `test_cloud_sessions_listed_and_bad_links_dropped` |
 | `bridgeSessionId` in a transcript | same, via a crafted transcript | linked only if it is exactly `cse_` plus 8 to 64 letters or digits; the link is built by the tool, not copied | `test_malformed_remote_control_id_not_linked` |
 | Session title used as link text | `]` ending the link label early | `[` and `]` escaped, on top of the H1 escaping | `test_where_shows_computer_app_and_remote_control_link` |
+| `repo`, `branch`, `started_from`, `first_request` in `data/cloud.json` (1.0.1) | markup in the Where column or SESSIONS.md | escaped like every other string | `test_cloud_sessions_listed_and_bad_links_dropped` (a branch containing `<b>`; shown failing with the escaping removed) |
 | Computer name in `all-sessions/computers/*.json` | markup in the name; a corrupt file breaking the sync | escaped like every other string; an unreadable file is skipped and logged | `test_sessions_from_another_computer_name_it` |
 
 The tool still opens no network connection: links are written into the Markdown, never fetched.

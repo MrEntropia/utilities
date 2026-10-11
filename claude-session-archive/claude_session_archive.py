@@ -26,7 +26,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 CACHE_VERSION = 2  # bump when scan_session() returns new fields, so cached rows are re-read
 STALE_SECONDS = 20 * 3600
 LOCK_STALE_SECONDS = 2 * 3600
@@ -224,6 +224,7 @@ SURFACES = {
 }
 # A Remote Control session records the id of its claude.ai counterpart; cse_X is session_X there.
 BRIDGE_ID = re.compile(r"cse_[A-Za-z0-9]{8,64}")
+DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 # Links accepted from data/cloud.json: claude.ai only, and no characters that end a Markdown link.
 CLOUD_URL = re.compile(r"https://claude\.ai/[A-Za-z0-9_./?=&%-]{1,200}")
 
@@ -395,12 +396,15 @@ def load_cloud(data_dir):
         if url and not CLOUD_URL.fullmatch(url):
             log(f"cloud.json: entry {i} url is not a claude.ai link; shown without it")
             url = ""
-        date = v.get("date") if isinstance(v.get("date"), str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", v["date"]) else ""
+        text = {k: v[k] if isinstance(v.get(k), str) else "" for k in
+                ("repo", "branch", "started_from", "first_request", "group", "date", "last")}
+        start = text["date"] if DATE.fullmatch(text["date"]) else ""
+        last = text["last"] if DATE.fullmatch(text["last"]) and text["last"] >= start else start
         rows.append({
             "id": "", "cloud": True, "url": url, "title": v["title"], "custom_title": None,
-            "start": date, "last": date, "cwd": v.get("repo") if isinstance(v.get("repo"), str) else "",
-            "prompt": "", "file": "",
-            "group_hint": v.get("group") if isinstance(v.get("group"), str) else "",
+            "start": start, "last": last, "cwd": text["repo"], "branch": text["branch"],
+            "started_from": text["started_from"], "prompt": text["first_request"][:160], "file": "",
+            "group_hint": text["group"],
             "summary": {k: v[k] for k in ("summary", "keep", "kind") if isinstance(v.get(k), str)},
         })
     return rows
@@ -419,7 +423,8 @@ def session_url(row):
 
 def where(row, computers):
     if row.get("cloud"):
-        return "Cloud (claude.ai)"
+        repo = row["cwd"] + (f" ({row['branch']})" if row["cwd"] and row["branch"] else "")
+        return clean(" · ".join(p for p in ("Cloud", row["started_from"], repo) if p))
     surface = SURFACES.get(row.get("entrypoint", ""), row.get("entrypoint", "")) or "unknown app"
     hosts = computers.get(row["file"]) or ["computer not recorded"]
     rc = ", Remote Control" if row.get("bridge") else ""

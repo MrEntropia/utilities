@@ -385,7 +385,9 @@ class SyncTests(Base):
     def test_cloud_sessions_listed_and_bad_links_dropped(self):
         (self.e.archive / "data" / "cloud.json").write_text(json.dumps({"sessions": [
             {"title": "Cloud idea", "url": "https://claude.ai/code/session_01Good", "date": "2026-09-30",
-             "group": "Ideas", "summary": "Explored it. More.", "kind": "Research", "repo": "me/repo"},
+             "group": "Ideas", "summary": "Explored it. More.", "kind": "Research", "repo": "me/repo",
+             "branch": "feat/x <b>", "started_from": "Android app", "last": "2026-10-02",
+             "first_request": "Look into <this>"},
             {"title": "Forged", "url": "https://claude.ai/x)[evil](https://evil.example"},
             {"title": "Script", "url": "javascript:alert(1)"},
             {"url": "https://claude.ai/code/session_01NoTitle"},
@@ -395,12 +397,17 @@ class SyncTests(Base):
         idx = (self.e.archive / "INDEX.md").read_text(encoding="utf-8")
         self.assertIn("### Ideas (1)", idx)
         self.assertIn("| 2026-09-30 | Research | [Cloud idea](https://claude.ai/code/session_01Good) "
-                      "| Cloud (claude.ai) | Explored it | `cloud` |", idx)
+                      "| Cloud · Android app · me/repo (feat/x &lt;b&gt;) | Explored it | `cloud` |", idx)
+        forged = next(l for l in idx.splitlines() if "| Forged |" in l)
+        self.assertIn("| Cloud |", forged, "an entry with no details still says Cloud")
         self.assertIn("## All sessions (4: 1 local, 3 cloud)", idx)
         self.assertNotIn("evil.example", idx)
         self.assertNotIn("javascript:", idx)
         self.assertIn("By type: 1 research.", idx)
-        self.assertIn("Transcript: not archived", (self.e.archive / "SESSIONS.md").read_text(encoding="utf-8"))
+        full = (self.e.archive / "SESSIONS.md").read_text(encoding="utf-8")
+        self.assertIn("Transcript: not archived", full)
+        self.assertIn("2026-09-30 to 2026-10-02 · repo · **Research**", full)
+        self.assertIn("First request: _Look into &lt;this&gt;_", full)
 
     def test_last_sync_names_computer(self):
         self.assertIn(socket.gethostname(), (self.e.archive / "LAST-SYNC.txt").read_text())
