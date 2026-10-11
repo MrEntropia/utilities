@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.2 (2026-10-11)
+
+- A cloud session transcript saved as `all-sessions/cloud/session_<id>.json` is linked from its `SESSIONS.md` entry instead of "not archived".
+
 ## 1.0.1 (2026-10-11)
 
 - Cloud sessions in `data/cloud.json` take `started_from`, `branch`, `last` and `first_request`; the Where column shows `Cloud · <started_from> · <repo> (<branch>)` instead of only `Cloud (claude.ai)`, and `SESSIONS.md` shows the date range and first request.

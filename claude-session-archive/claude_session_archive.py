@@ -26,7 +26,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 CACHE_VERSION = 2  # bump when scan_session() returns new fields, so cached rows are re-read
 STALE_SECONDS = 20 * 3600
 LOCK_STALE_SECONDS = 2 * 3600
@@ -383,9 +383,10 @@ def load_computers(root):
     return seen
 
 
-def load_cloud(data_dir):
+def load_cloud(data_dir, saved_dir):
     """Cloud sessions (claude.ai/code) listed by hand in data/cloud.json. Their transcripts are
-    not on any computer, so this is how they get into the index at all."""
+    not on any computer, so this is how they get into the index at all. A copy you saved as
+    all-sessions/cloud/session_<id>.json is shown as the transcript."""
     raw = read_data(data_dir / "cloud.json", "cloud sessions").get("sessions", [])
     rows = []
     for i, v in enumerate(raw if isinstance(raw, list) else []):
@@ -404,10 +405,18 @@ def load_cloud(data_dir):
             "id": "", "cloud": True, "url": url, "title": v["title"], "custom_title": None,
             "start": start, "last": last, "cwd": text["repo"], "branch": text["branch"],
             "started_from": text["started_from"], "prompt": text["first_request"][:160], "file": "",
+            "saved": saved_copy(saved_dir, url),
             "group_hint": text["group"],
             "summary": {k: v[k] for k in ("summary", "keep", "kind") if isinstance(v.get(k), str)},
         })
     return rows
+
+
+def saved_copy(saved_dir, url):
+    m = re.search(r"/(session_[A-Za-z0-9]{8,64})$", url)
+    if m and (saved_dir / f"{m.group(1)}.json").is_file():
+        return f"{m.group(1)}.json"
+    return ""
 
 
 def link(label, url):
@@ -466,7 +475,7 @@ def build_index(archive):
     computers = load_computers(archive / "all-sessions")
     rows = scan_all(src) if src.is_dir() else []
     local_count = len(rows)
-    cloud = load_cloud(data)
+    cloud = load_cloud(data, archive / "all-sessions" / "cloud")
     rows += cloud
     for r in rows:
         r["group"] = group_of(r, by_prefix)
@@ -486,7 +495,7 @@ def build_index(archive):
         "Resume a local one from a terminal in its project folder: `claude --resume <id>`.",
         "Groups come from a `Group: ` prefix on a title you set with /rename, or from `data/groups.json`.",
         f"Summaries and types come from `data/summaries.json`; {missing} session(s) have none yet.",
-        "Cloud sessions (claude.ai/code) are listed by hand in `data/cloud.json`; their transcripts are not archived.", "",
+        "Cloud sessions (claude.ai/code) are listed by hand in `data/cloud.json`; a transcript you saved as `all-sessions/cloud/session_<id>.json` is linked from its entry.", "",
     ]
     for name in names:
         group_rows = [r for r in rows if r["group"] == name]
@@ -511,7 +520,8 @@ def build_index(archive):
             if r["prompt"]:
                 full += [f"First request: _{clean(r['prompt'])}_", ""]
             if r.get("cloud"):
-                full += ["Transcript: not archived (stored on claude.ai only)", ""]
+                saved = f"`all-sessions/cloud/{clean(r['saved'])}` (a copy saved from claude.ai)" if r["saved"] else ""
+                full += [f"Transcript: {saved or 'not archived (stored on claude.ai only)'}", ""]
             else:
                 full += [f"Transcript: `all-sessions/projects/{clean(r['file'])}`", ""]
     write_atomic(archive / "SESSIONS.md", "\n".join(full))
