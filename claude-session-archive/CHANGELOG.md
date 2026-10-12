@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.4.0 (2026-10-12)
+
+Fixes from the third independent review (R1 to R10, see `securityaudit.md`), all on `redact` and the `SECRETS.md` triage:
+
+- A private key is found and redacted whole, header to footer, also when a transcript stores it with escaped line breaks (before, only its first line was replaced and the report then went quiet).
+- Redactions stick: `data/redacted.json` records the fingerprints you redacted, and every sync and import re-applies them to what it copies.
+- A transcript skipped as in use is skipped together with its archive copy; rewritten files keep their timestamps and line endings.
+- Values containing `, ; ( ) [ ] { }` are replaced whole; other copies of the same text in forms the scan does not know are reported (never printed).
+- Non-UTF-8 files, unknown fingerprints and write failures are reported per file with exit code 1, never a traceback.
+- Triage: test words count only as whole words in the message text; `.internal` and bare names like `db` no longer count as local hosts; a live-format key is never folded on wording; `@` in the report cannot become an e-mail link; correct session counts for `versions/` copies and memory notes.
+- A missing `data/.secrets-salt` in an archive that has been scanned before stops the scan with a message instead of silently creating a new one.
+
 ## 1.3.0 (2026-10-12)
 
 - `SECRETS.md` is sorted into **Needs attention** (marked ⚠️) and a folded section (a `<details>` toggle) for findings that are probably not live: short-lived sign-in tokens, local or example database hosts, values only ever next to test, fixture, seed or example text. Each row says where the value came from (database user and host, or variable name, never the value), how many places and sessions hold it, and links to the first transcript (relative path) and to the session on claude.ai. `INDEX.md` shows how many need attention.

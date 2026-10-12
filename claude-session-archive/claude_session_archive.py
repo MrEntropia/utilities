@@ -34,7 +34,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 CACHE_VERSION = 4  # bump when scan_session() returns new fields, so cached rows are re-read
 STALE_SECONDS = 20 * 3600
 LOCK_STALE_SECONDS = 2 * 3600
@@ -123,7 +123,7 @@ def archive_dir():
 # ---------------------------------------------------------------- sync
 
 
-def copy_additive(src, archive_root, host):
+def copy_additive(src, archive_root, host, written=None):
     """Copy local files into the archive without ever replacing a version with less.
 
     - New file: copied.
@@ -159,6 +159,8 @@ def copy_additive(src, archive_root, host):
                 d.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(s, d)
                 copied += 1
+                if written is not None:
+                    written.append(d)
             except OSError as exc:
                 log(f"skip {s}: {exc}")
     return copied
@@ -204,10 +206,14 @@ def cmd_sync(args):
     try:
         STAMP.touch()  # at the start, so session starts during a long sync do not pile up
         host = socket.gethostname()
-        copied = 0
+        copied, written = 0, []
         if PROJECTS.is_dir():
-            copied = copy_additive(PROJECTS, archive / "all-sessions", host)
+            copied = copy_additive(PROJECTS, archive / "all-sessions", host, written)
             write_computer_manifest(PROJECTS, archive / "all-sessions", host)
+        try:  # what you redacted stays redacted, whatever this computer's transcripts still hold
+            enforce_redactions(archive, written)
+        except (Fail, OSError, ValueError) as exc:
+            log(f"redactions not re-applied: {exc}")
         try:  # a failed scan must never stop the archive from being kept
             write_secrets_report(archive, *scan_secrets(archive))
         except (Fail, OSError, ValueError) as exc:
@@ -822,7 +828,7 @@ def cmd_digest(args):
 # over transcript lines that can be megabytes long. Order matters: the first match at a position wins.
 SECRET_PATTERNS = [
     ("Private key", re.compile(r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY-----"
-                               r"(?:\s|\\[nr]){0,6}(?P<value>[A-Za-z0-9+/=]{40,200})?")),
+                               r"\s{0,8}(?P<value>[A-Za-z0-9+/=][A-Za-z0-9+/=\s]{39,16000})?")),
     ("Anthropic API key", re.compile(r"(?<![A-Za-z0-9_-])sk-ant-[A-Za-z0-9_-]{20,200}")),
     ("OpenAI API key", re.compile(r"(?<![A-Za-z0-9_-])sk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{32,200}")),
     ("AWS access key id", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
@@ -839,14 +845,14 @@ SECRET_PATTERNS = [
     ("JSON Web Token (usually short-lived)", re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{10,2000}\.eyJ[A-Za-z0-9_-]{10,4000}\.[A-Za-z0-9_-]{10,2000}")),
     ("Password or secret assignment", re.compile(
         r"(?i)(?<![A-Za-z0-9_])(?!from_secret)(?P<name>(?:[A-Za-z0-9]{1,20}_){0,4}(?:password|passwd|secret|secret_key|secret_access_key|api_key|"
-        r"access_token|auth_token|private_key|client_secret))(?:=|\s{0,3}:\s{1,3})(?P<value>[^\s\"'`\\<>,;(){}\[\]]{8,200})")),
+        r"access_token|auth_token|private_key|client_secret))(?:=|\s{0,3}:\s{1,3})(?P<value>[^\s\"'`\\<>(){}\[\]]{7,199}[^\s\"'`\\<>(){}\[\],;])")),
     ("Password or secret assignment", re.compile(
         r"(?i)\b(?P<name>password|passwd|pwd|secret|api_?key|access_?token|auth_?token|client_secret)\\?[\"']?\s{0,3}[:=]\s{0,3}\\?[\"']"
-        r"(?P<value>[^\"'\s\\<>]{8,200})\\?[\"']")),
+        r"(?P<value>[^\"'\\\n<>]{8,200})\\?[\"']")),
 ]
 UNQUOTED_ASSIGNMENT = next(rx for k, rx in SECRET_PATTERNS if k == "Password or secret assignment")
 # Values that are obviously not real: placeholders, examples, variable references, masks.
-PLACEHOLDER = re.compile(r"(?i)(?:x{6}|\*{4}|\.{3}|example|placeholder|changeme|your[_-]|<|\$\{|\$\(|\$[A-Z_]|redacted|dummy|sample|test|correct-horse)")
+PLACEHOLDER = re.compile(r"(?i)(?:x{6}|\*{4}|\.{3}|example|placeholder|changeme|your[_-]|<|\$\{|\$\(|\$[A-Z_]|ENC\[|redacted|dummy|sample|test|correct-horse)")
 # A literal every match of a pattern contains, so a pattern only runs on lines that could match.
 # Lines are lowercased for the check when the anchor is lowercase and the pattern ignores case.
 SECRET_ANCHORS = {
@@ -890,10 +896,23 @@ def secrets_salt(archive):
             return salt
     except OSError:
         pass
+    if (archive / "SECRETS.md").exists() or (archive / "data" / "redacted.json").exists():
+        # An earlier scan made a salt; it may not have synced to this computer yet. A new one
+        # would change every fingerprint and silently break triage, ignore and redaction lists.
+        raise Fail(f"{path} is missing although this archive has been scanned before; "
+                   "wait for your drive to finish syncing (or restore the file) and try again")
     salt = random_bytes.token_hex(32)
     path.parent.mkdir(parents=True, exist_ok=True)
     write_atomic(path, salt + "\n")
     return salt
+
+
+def finding_fp(kind, value, salt):
+    """The fingerprint of a finding: a private key is identified by its body without line breaks,
+    so the same key written with real or escaped newlines is one finding."""
+    if kind == "Private key":
+        value = re.sub(r"\s", "", value)
+    return fingerprint(value, salt)
 
 
 def fingerprint(value, salt=""):
@@ -904,8 +923,12 @@ def looks_random(value):
     return any(c.isdigit() for c in value) and any(c.islower() for c in value) and any(c.isupper() for c in value)
 
 
-TEST_WORDS = re.compile(r"(?i)test|fixture|mock|fake|stub|example|sample|spec\b|seed|dummy|\.example")
-LOCAL_HOSTS = re.compile(r"(?i)^(?:localhost?|127\.\d{1,3}\.\d{1,3}\.\d{1,3}|host|db|database|\S{0,60}\.(?:local|internal|test|example|invalid))$")
+TEST_WORDS = re.compile(r"(?i)\b(?:tests?|testing|fixtures?|mocks?|fakes?|stubs?|stubBundles|examples?|samples?|specs?|seed|dummy)\b")
+LOCAL_HOSTS = re.compile(r"(?i)^(?:localhost?|127\.\d{1,3}\.\d{1,3}\.\d{1,3}|\S{0,60}\.(?:local|localhost|test|example|invalid)"
+                         r"|(?:\S{0,60}\.)?example\.(?:com|net|org))$")
+# Kinds whose format proves nothing about whether they are live: only these may be folded for
+# appearing next to test or example wording. A key in a live format needs your verdict.
+WORDING_FOLDABLE = ("Password or secret assignment", "Database URL with password")
 
 
 def find_secrets(line):
@@ -957,15 +980,30 @@ def find_secret_spans(line):
                 where_.append(groups["name"])
             vstart = m.start("value") if "value" in rx.groupindex else start
             before = line[max(0, vstart - 300):vstart]
+            # only the message text: not the session metadata (cwd, branch) earlier on the line
+            cut = max(before.rfind('"text":'), before.rfind('"content":'), before.rfind('"stdout":'))
+            before = before[cut:] if cut >= 0 else before
             context = {"where": " ".join(where_)[:120], "test": bool(TEST_WORDS.search(before)),
                        "local": bool(groups.get("host") and LOCAL_HOSTS.match(groups["host"]))}
             yield kind, value, vstart, vstart + len(value), context
 
 
+def secret_units(path):
+    """(text, first line number) pieces of a file to scan: each line of a .jsonl transcript (one
+    record per line), or the whole of any other file, so a key written over several lines in a
+    note is found whole. Read without newline translation, so offsets match the bytes on disk."""
+    with open(path, encoding="utf-8", errors="strict", newline="") as fh:
+        if path.suffix == ".jsonl":
+            for n, line in enumerate(fh, 1):
+                yield line, n
+        else:
+            yield fh.read(), 1
+
+
 def patterns_version():
     """Changes whenever a pattern does, so cached scan results never outlive the rules that made them."""
     text = ("|".join(f"{k}={rx.pattern}" for k, rx in SECRET_PATTERNS) + PLACEHOLDER.pattern + repr(NEEDS_RANDOM)
-            + TEST_WORDS.pattern + LOCAL_HOSTS.pattern + "hit-format-2")
+            + TEST_WORDS.pattern + LOCAL_HOSTS.pattern + "hit-format-3")
     return hashlib.sha256(text.encode()).hexdigest()[:16]
 
 
@@ -1000,16 +1038,17 @@ def scan_secrets(archive):
             continue
         hits = []
         try:
-            with open(path, encoding="utf-8", errors="replace") as fh:
-                for n, line in enumerate(fh, 1):
-                    seen = set()  # a line often repeats a value
-                    for kind, value, _s, _e, ctx in find_secret_spans(line):
-                        fp = fingerprint(value, salt)
-                        if fp not in seen:
-                            seen.add(fp)
-                            hits.append([fp, kind, mask(value, kind), n, ctx["where"], ctx["test"], ctx["local"]])
-        except OSError as exc:
-            log(f"skip {path}: {exc}")
+            for unit, n in secret_units(path):
+                seen = set()  # a line often repeats a value
+                for kind, value, start, _e, ctx in find_secret_spans(unit):
+                    fp = finding_fp(kind, value, salt)
+                    if fp not in seen:
+                        seen.add(fp)
+                        line_no = n + unit.count("\n", 0, start)
+                        hits.append([fp, kind, mask(re.sub(r"\s", "", value) if kind == "Private key" else value, kind),
+                                     line_no, ctx["where"], ctx["test"], ctx["local"]])
+        except (OSError, UnicodeDecodeError) as exc:
+            log(f"skip {path}: {type(exc).__name__}")
             continue
         new[rel] = {"sig": sig, "hits": hits}
     try:
@@ -1029,7 +1068,8 @@ def scan_secrets(archive):
             h["count"] += 1
             h["test"] += bool(test)
             h["local"] += bool(local)
-            h["sessions"].add(session_of(rel))
+            if session_of(rel):
+                h["sessions"].add(session_of(rel))
             if where_:
                 h["where"].add(where_)
             if len(h["places"]) < 1000:
@@ -1039,23 +1079,27 @@ def scan_secrets(archive):
 
 def session_of(rel):
     """The session a file under all-sessions/ belongs to, from the folder layout:
-    projects/<project>/<session>.jsonl (or <session>/subagents/...), cloud/<session>.json,
-    versions/<computer>/<project>/<session>..., cloud/versions/<session>.<hash>.json."""
+    projects/<project>/<session>.jsonl or projects/<project>/<session>/subagents/...,
+    versions/<computer>/<project>/... (same shape), cloud/<session>.json and
+    cloud/versions/<session>.<hash>.json. Memory notes belong to no session ("")."""
     parts = rel.split("/")[1:] if rel.startswith("all-sessions/") else rel.split("/")
-    if parts[:1] == ["versions"]:
-        parts = parts[2:]
-    if parts[:1] == ["projects"] and len(parts) >= 3:
-        name = parts[2]
-    elif parts[:1] == ["cloud"] and len(parts) >= 2:
-        name = parts[-1]
+    if parts[:1] == ["cloud"] and len(parts) >= 2:
+        return parts[-1].split(".")[0]
+    if parts[:1] == ["projects"]:
+        rest = parts[2:]
+    elif parts[:1] == ["versions"]:
+        rest = parts[3:]
     else:
         return ""
-    return name.split(".")[0] if name.split(".")[0] != "memory" else ""
+    if len(rest) == 1 and rest[0].endswith(".jsonl"):
+        return rest[0][:-len(".jsonl")]
+    if len(rest) >= 2 and rest[0] != "memory":
+        return rest[0]
+    return ""
 
 
 TRIAGE_STATUSES = {"real": "you marked it real", "dev": "development value", "test": "test value",
-                   "example": "example or documentation", "rotated": "rotated", "not-secret": "not a secret",
-                   "redacted": "replaced by a descriptor"}
+                   "example": "example or documentation", "rotated": "rotated", "not-secret": "not a secret"}
 
 
 def triage_of(h, triage):
@@ -1068,7 +1112,7 @@ def triage_of(h, triage):
         return "unlikely", "sign-in token, usually expires within hours"
     if h["local"] and h["local"] == h["count"]:
         return "unlikely", "local or example database host"
-    if h["test"] and h["test"] == h["count"]:
+    if h["test"] and h["test"] == h["count"] and h["kind"] in WORDING_FOLDABLE:
         return "unlikely", "only ever next to test, fixture, seed or example text"
     return "attention", ""
 
@@ -1100,8 +1144,8 @@ def write_secrets_report(archive, files, found):
             out += f" · [claude.ai]({url})"
         return out + (f" · {clean(r.get('start', ''))}" if r.get("start") else "")
 
-    def what(h):
-        return clean(", ".join(sorted(h["where"]))[:100]) or ""
+    def what(h):  # "@" as an entity, so user@host is not turned into an e-mail link
+        return clean(", ".join(sorted(h["where"]))[:100]).replace("@", "&#64;") or ""
 
     order = lambda pair: (pair[0]["kind"], -len(pair[0]["sessions"]))
     out = [
@@ -1159,6 +1203,16 @@ def cmd_secrets(args):
 # ---------------------------------------------------------------- redact
 
 IN_USE_SECONDS = 600  # a transcript written this recently may belong to a running session
+REDACTED = "redacted.json"  # data/redacted.json: fingerprints you redacted, re-applied on every sync and import
+
+
+DESCRIPTOR_RE = re.compile(r"<secret removed: [^<>\n]{0,300}>")
+
+
+def distinctive(value):
+    """Worth searching for elsewhere: an ordinary word (a password like "postgres") would be found
+    all over the transcripts in its ordinary sense, so it is not counted."""
+    return len(value) >= 8 and any(c.isdigit() for c in value) and any(c.isalpha() for c in value)
 
 
 def descriptor(kind, where_, fp):
@@ -1166,74 +1220,159 @@ def descriptor(kind, where_, fp):
     return re.sub(r'["\\\x00-\x1f]', "", text)  # stays valid inside a JSON string
 
 
-def redact_file(path, targets, salt, apply):
-    """{fingerprint: count} replaced (or that would be) in one file; raises Fail if a line would
-    stop being valid JSON. Only the matched value is replaced, at its exact position."""
-    try:
-        lines = path.read_text(encoding="utf-8").split("\n")
-    except (OSError, UnicodeDecodeError):
-        return {}
-    counts, changed = {}, False
-    for i, line in enumerate(lines):
-        spans = [(st, en, fingerprint(v, salt), k, ctx) for k, v, st, en, ctx in find_secret_spans(line)]
+def redact_text(path, text, targets, salt, values):
+    """(new text, {fingerprint: count}) with every target credential replaced at its exact position.
+    Raises Fail if a JSON line would stop parsing. Collects the replaced values in `values` (memory
+    only) so the caller can look for other copies of the same text."""
+    counts = {}
+    units = text.split("\n") if path.suffix == ".jsonl" else [text]
+    for i, unit in enumerate(units):
+        spans = [(st, en, finding_fp(k, v, salt), k, ctx, v) for k, v, st, en, ctx in find_secret_spans(unit)]
         spans = [x for x in spans if x[2] in targets]
         if not spans:
             continue
-        new = line
-        for st, en, fp, kind, ctx in sorted(spans, reverse=True):
+        new = unit
+        for st, en, fp, kind, ctx, value in sorted(spans, reverse=True):
             new = new[:st] + descriptor(kind, ctx["where"], fp) + new[en:]
             counts[fp] = counts.get(fp, 0) + 1
+            values.setdefault(fp, set()).add(value.strip())
         if path.suffix in (".jsonl", ".json"):
-            try:
-                json.loads(line)
-                was_json = True
-            except (ValueError, RecursionError):
-                was_json = False
-            if was_json:
+            pieces = [(unit, new)] if path.suffix == ".jsonl" else list(zip(unit.split("\n"), new.split("\n")))
+            for old_l, new_l in pieces:
                 try:
-                    json.loads(new)
+                    json.loads(old_l)
+                except (ValueError, RecursionError):
+                    continue
+                try:
+                    json.loads(new_l)
                 except (ValueError, RecursionError):
                     raise Fail(f"{path}: line {i + 1} would not stay valid JSON; file left unchanged")
-        lines[i], changed = new, True
-    if changed and apply:
-        mode = path.stat().st_mode & 0o777
-        write_atomic(path, "\n".join(lines), mode=mode)
-    return counts
+        units[i] = new
+    return "\n".join(units), counts
+
+
+def read_exact(path):
+    with open(path, encoding="utf-8", errors="strict", newline="") as fh:
+        return fh.read()
+
+
+def rewrite_keeping_times(path, text):
+    """Replace a file's content atomically, keeping its permissions and timestamps, so a
+    rewritten transcript does not look recently used (or newly grown) to anything else."""
+    st = path.stat()
+    write_atomic(path, text, mode=st.st_mode & 0o777)
+    os.utime(path, (st.st_atime, st.st_mtime))
+
+
+def load_redacted(archive):
+    data = read_data(archive / "data" / REDACTED, "redacted fingerprints").get("redacted", {})
+    return {fp: v for fp, v in data.items() if isinstance(fp, str) and re.fullmatch(r"[0-9a-f]{12}", fp)} if isinstance(data, dict) else {}
+
+
+def enforce_redactions(archive, paths):
+    """Re-apply recorded redactions to archive files just written by a sync or an import, so a
+    copy from another computer, an unredacted local transcript or a newer claude.ai export
+    cannot bring a redacted credential back. Returns the number of values replaced."""
+    targets = load_redacted(archive)
+    if not targets or not paths:
+        return 0
+    salt = secrets_salt(archive)
+    total = 0
+    for path in paths:
+        try:
+            if path.is_symlink() or not path.is_file() or path.suffix not in SECRET_SUFFIXES:
+                continue
+            text = read_exact(path)
+            new, counts = redact_text(path, text, targets, salt, {})
+            if counts:
+                rewrite_keeping_times(path, new)
+                total += sum(counts.values())
+        except (OSError, UnicodeDecodeError, Fail) as exc:
+            log(f"could not re-apply redactions to {path}: {exc}")
+    if total:
+        log(f"re-applied redactions: {total} value(s)")
+    return total
 
 
 def cmd_redact(args):
     """Replace chosen credentials, by fingerprint, with a <descriptor> in the archive and in this
-    computer's transcripts (so the next sync does not bring them back). Dry run unless --apply."""
+    computer's transcripts, and record them so every later sync and import keeps them out.
+    Dry run unless --apply."""
     archive = archive_dir()
     targets = {f.strip().strip("`") for f in args.fingerprints}
     bad = [f for f in targets if not re.fullmatch(r"[0-9a-f]{12}", f)]
     if bad:
         raise Fail(f"not a fingerprint from SECRETS.md: {', '.join(sorted(bad))}")
     salt = secrets_salt(archive)
-    roots = [archive / "all-sessions", PROJECTS]
+    arch_root = archive / "all-sessions"
     if not acquire_lock():
         raise Fail("a sync is running; try again in a minute")
-    totals, files, skipped, problems = {}, 0, [], []
+    totals, changed, problems, skipped, values, leftover = {}, [], [], [], {}, {}
+
+    def pair_key(root, path):  # the same transcript, locally and in the archive
+        try:
+            return path.relative_to(PROJECTS if root == PROJECTS else arch_root / "projects").as_posix()
+        except ValueError:
+            return None
+
     try:
-        for root in roots:
+        plan = []
+        for root in (arch_root, PROJECTS):
             for path in sorted(root.rglob("*")) if root.is_dir() else []:
                 if path.is_symlink() or not path.is_file() or path.suffix not in SECRET_SUFFIXES:
                     continue
                 try:
-                    counts = redact_file(path, targets, salt, apply=False)
-                except Fail as exc:
+                    text = read_exact(path)
+                    new, counts = redact_text(path, text, targets, salt, values)
+                except UnicodeDecodeError:
+                    problems.append(f"{path}: not UTF-8 text, not checked")
+                    continue
+                except (OSError, Fail) as exc:
                     problems.append(str(exc))
                     continue
-                if not counts:
+                if counts:
+                    plan.append((root, path, new, counts))
+        # A transcript in use is skipped, and so is its archive copy: redacting only one of the
+        # pair would let the next sync copy the original back beside or over it.
+        in_use = set()
+        for root, path, _n, _c in plan:
+            if root == PROJECTS and time.time() - path.stat().st_mtime < IN_USE_SECONDS:
+                in_use.add(path.relative_to(PROJECTS).as_posix())
+        for root, path, new, counts in plan:
+            if pair_key(root, path) in in_use:
+                skipped.append(str(path))
+                continue
+            if args.apply:
+                try:
+                    rewrite_keeping_times(path, new)
+                except OSError as exc:
+                    problems.append(f"{path}: could not write ({type(exc).__name__}); left unchanged")
                     continue
-                if root == PROJECTS and time.time() - path.stat().st_mtime < IN_USE_SECONDS:
-                    skipped.append(str(path))
-                    continue
-                if args.apply:
-                    redact_file(path, targets, salt, apply=True)
-                files += 1
-                for fp, n in counts.items():
-                    totals[fp] = totals.get(fp, 0) + n
+            changed.append(path)
+            for fp, n in counts.items():
+                totals[fp] = totals.get(fp, 0) + n
+        # Other copies of the same text that no pattern recognised (mysql -pVALUE, a quoted form
+        # the patterns do not know): counted, never printed.
+        if args.apply and values:
+            for root in (arch_root, PROJECTS):
+                for path in sorted(root.rglob("*")) if root.is_dir() else []:
+                    if path.is_symlink() or not path.is_file() or path.suffix not in SECRET_SUFFIXES:
+                        continue
+                    try:
+                        text = read_exact(path)
+                    except (OSError, UnicodeDecodeError):
+                        continue
+                    text = DESCRIPTOR_RE.sub("", text)  # our own descriptors name the user, not the value
+                    for fp, vals in values.items():
+                        n = sum(text.count(v) for v in vals if distinctive(v))
+                        if n:
+                            leftover.setdefault(fp, []).append((path, n))
+        if args.apply and totals:
+            ledger = read_data(archive / "data" / REDACTED, "redacted fingerprints")
+            rec = ledger.get("redacted") if isinstance(ledger.get("redacted"), dict) else {}
+            for fp in totals:
+                rec.setdefault(fp, {"date": f"{datetime.now():%Y-%m-%d}"})
+            write_atomic(archive / "data" / REDACTED, json.dumps({"redacted": rec}, indent=2) + "\n")
     finally:
         try:
             LOCK.unlink()
@@ -1241,20 +1380,27 @@ def cmd_redact(args):
             pass
     verb = "replaced" if args.apply else "would replace"
     for fp in sorted(targets):
-        print(f"{fp}: {verb} {totals.get(fp, 0)} occurrence(s)")
-    print(f"{files} file(s) {'changed' if args.apply else 'affected'} (archive and this computer's ~/.claude/projects)")
+        n = totals.get(fp, 0)
+        print(f"{fp}: {verb} {n} occurrence(s)" + ("" if n or skipped else "  (not found: check the fingerprint against SECRETS.md)"))
+    print(f"{len(changed)} file(s) {'changed' if args.apply else 'affected'} (archive and this computer's ~/.claude/projects)")
     for p in skipped:
-        print(f"skipped, in use (changed in the last {IN_USE_SECONDS // 60} minutes): {p}")
+        print(f"skipped, in use (changed in the last {IN_USE_SECONDS // 60} minutes), with its archive copy: {p}")
     for p in problems:
         print(f"problem: {p}")
     if args.apply:
+        for fp, places in sorted(leftover.items()):
+            n = sum(c for _p, c in places)
+            print(f"{fp}: the same text still appears {n} time(s) in {len(places)} file(s) in a form the scan does not "
+                  f"recognise (for example a command-line flag); look for it there. First: {places[0][0]}")
         write_secrets_report(archive, *scan_secrets(archive))
         build_index(archive)
-        print("Other computers still hold their own copies: run the same command there too. "
+        print("Recorded in data/redacted.json: every later sync and import re-applies these redactions to what it copies. "
+              "Other computers' own transcripts still hold the original until you run this there; "
               "claude.ai keeps its own copy of cloud and Remote Control sessions.")
     else:
         print("Dry run: nothing changed. Add --apply to replace them.")
-    return 1 if problems or skipped else 0
+    missing = [fp for fp in targets if not totals.get(fp)]
+    return 1 if problems or skipped or missing else 0
 
 
 # ---------------------------------------------------------------- import
@@ -1336,6 +1482,9 @@ def event_keys(events):
     return keys
 
 
+WRITTEN = []  # files the current import wrote, for enforce_redactions
+
+
 def file_record(dest, rec):
     """Write one session record. Returns new / updated / unchanged / kept-beside / skipped.
     A saved copy is only replaced by one that contains every event it has; any other different
@@ -1355,6 +1504,7 @@ def file_record(dest, rec):
         return "skipped"
     if not out.exists():
         write_atomic(out, body)
+        WRITTEN.append(out)
         return "new"
     try:
         have = json.loads(out.read_text(encoding="utf-8")).get("events")
@@ -1368,6 +1518,7 @@ def file_record(dest, rec):
             return "unchanged"
         if old_keys <= new_keys:
             write_atomic(out, body)
+            WRITTEN.append(out)
             return "updated"
     # Different content, or an existing copy that cannot be read: keep both.
     side = dest / "versions" / f"{sid}.{hashlib.sha256(body.encode('utf-8')).hexdigest()[:12]}.json"
@@ -1375,6 +1526,7 @@ def file_record(dest, rec):
         return "unchanged"
     side.parent.mkdir(parents=True, exist_ok=True)
     write_atomic(side, body)
+    WRITTEN.append(side)
     return "kept beside"
 
 
@@ -1412,6 +1564,10 @@ def cmd_import(args):
                         added.append(re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", str(title))[:100])
             except (OSError, EOFError, UnicodeDecodeError, ValueError, gzip.BadGzipFile if hasattr(gzip, "BadGzipFile") else OSError) as exc:
                 problems.append(f"{path.name}: unreadable ({type(exc).__name__}); sessions before the error were kept")
+        try:
+            enforce_redactions(archive, WRITTEN)
+        except (Fail, OSError, ValueError) as exc:
+            problems.append(f"redactions not re-applied: {exc}")
     finally:
         try:
             LOCK.unlink()

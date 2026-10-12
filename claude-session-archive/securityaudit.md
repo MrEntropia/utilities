@@ -12,8 +12,8 @@ Date: 2026-10-11. Scope: `claude_session_archive.py`, `install.sh`, `install.ps1
 
 | Check | Result |
 |---|---|
-| Test suite, Python 3.9.6 (macOS system Python) | 63 tests, all pass |
-| Test suite, Python 3.13 (Homebrew) | 63 tests, all pass |
+| Test suite, Python 3.9.6 (macOS system Python) | 82 tests, all pass |
+| Test suite, Python 3.13 (Homebrew) | 82 tests, all pass |
 | Python 3.8 syntax (`ast.parse(feature_version=(3, 8))`) | pass |
 | `sh -n install.sh` | pass |
 | Hook format accepted by Claude Code 2.1.296 (a real headless session with an exec-form `SessionStart` hook, both blocking and `async`) | both hooks ran |
@@ -171,27 +171,60 @@ Each fix was reverted alone in a scratch copy and the suite run: F1 bracket esca
 
 | Check | Result |
 |---|---|
-| Test suite, Python 3.13 and 3.9.6 | 63 tests, all pass |
+| Test suite, Python 3.13 and 3.9.6 | 82 tests, all pass |
 | Real archive (240 sessions, 2,650 files, about 1.7 GB) | full scan about 4 minutes, then a sync in under a second |
 
-## 1.3.0: triage and `redact` (author's own review, not yet independently reviewed)
+## Third review: `redact` and the SECRETS.md triage (1.3.0, fixed in 1.4.0)
 
-`redact` is the first command that changes transcripts, so it was designed against these hazards, each pinned by a test that was shown failing with its guard removed:
+Date: 2026-10-12. Scope: `redact`, which rewrites transcripts irreversibly, and the triage added to `SECRETS.md`, at commit `87867fa`. Same method as before: an independent reviewer, read-only, reproducing every finding with the real CLI in throwaway folders and fake secrets, including a 20,000-case fuzz of the replacement offsets. Before this review, 1.3.0 had only the author's own review; the review found what that missed. None of the findings of the two earlier reviews had regressed.
 
-| Hazard | Guard | Test |
+### Findings and fixes
+
+| # | Severity | Finding | Fix (1.4.0) | Test |
+|---|---|---|---|---|
+| R1 | **High** | A private key stored in a transcript has its line breaks as JSON `\n` escapes, so the pattern matched its first line only. `redact` replaced that line and left the rest (24 of 25 lines in the repro), and the next scan, seeing a header followed by a descriptor, stopped listing the key: the user was told it was gone. | The key is matched whole, header to the end of its body, across escaped or real line breaks (notes are scanned whole, not line by line), fingerprinted by its body without line breaks, and replaced whole. | `test_r1_whole_private_key_is_redacted` |
+| R2 | Medium | Redaction stopped where the pattern stopped: `DB_PASSWORD=Hunter2024;Zq9!x8Lm` lost only `Hunter2024`. The same value in another form (`mysql -p...`) was untouched, and the scan then reported nothing. | Values may contain `, ; ( ) [ ] { }` (and anything but quotes inside quotes). After `--apply`, the remaining copies of each replaced value are counted per file and reported (never printed); ordinary words are not counted, so the check does not cry wolf. | `test_r2_value_with_punctuation_is_replaced_whole_and_other_forms_reported`, `test_leftover_check_ignores_an_ordinary_word` |
+| R3 | Medium | A transcript skipped as in use still had its archive copy redacted; the next sync then filed the unredacted local copy beside it, and once the session grew, over it. Another computer's sync did the same. | The in-use skip covers the pair. Redacted fingerprints are recorded (no values) in `data/redacted.json`, and every sync re-applies them to whatever it copies into the archive. | `test_r3_in_use_transcript_skips_its_archive_copy_too`, `test_r3_sync_reapplies_redactions_to_whatever_it_copies` |
+| R4 | Medium | `redact` set rewritten files' modification time to now, so a second run within 10 minutes saw them all as in use (leading into R3). An undocumented `redacted` triage status could then hide a value that came back. | Rewrites keep the file's timestamps and permissions; the `redacted` status is gone (the ledger in R3 replaces it). | `test_r4_redact_keeps_timestamps` |
+| R5 | Medium | Importing a newer claude.ai export of a redacted session counted as an update and restored the original. | Every import re-applies the recorded redactions to what it writes. | `test_r5_import_reapplies_redactions` |
+| R6 | Medium | The triage guess folded real credentials: "test" matched inside "latest" or "contest", and in session metadata before the message; every `*.internal` host and the bare names `db`, `host`, `database` counted as local. In the repro all five findings folded and the report said nothing needed attention. | Test words count only as whole words in the message text; only `localhost`, `127.x`, `*.local`, `*.localhost`, `*.test`, `*.example`, `*.invalid` and `example.com/net/org` are local; and a key in a live format is never folded for nearby wording, only by your verdict. | `test_r6_latest_or_internal_host_does_not_fold_a_real_credential`, `test_attention_first_others_folded_with_links` |
+| R7 | Low | A non-UTF-8 file was silently not redacted ("replaced 0", exit 0), and an unknown fingerprint gave the same output. | Both are reported, with exit code 1. | `test_r7_unknown_fingerprint_is_reported` |
+| R8 | Low | A write error during `--apply` stopped with a traceback, part-way through, without a summary or a rebuilt report. | Each file is handled separately: a failure is reported, the others are processed, and the summary, report and index are always produced. | `test_r8_a_write_failure_is_reported_and_the_rest_continues` |
+| R9 | Low | `redact` converted CRLF and lone CR line endings to LF, changing bytes outside the value. | Files are read and written without newline translation. | `test_r9_line_endings_are_preserved` |
+| R10 | Low | Session counts and "First seen in" were wrong for `versions/<computer>/` copies, and memory notes counted as an extra nameless session. | The session is derived from each real layout; memory notes belong to no session. | `test_r10_session_of_layouts` |
+| R11 | Info | `INDEX.md`, `SESSIONS.md` and the index cache quote each session's first request (160 characters), credentials included, and are not scanned. | Documented in the README; a `redact` clears them because they are rebuilt from the redacted transcripts. | n/a |
+| S3 | Info | If `data/.secrets-salt` had not synced yet to a computer, a scan created a new one, changing every fingerprint and breaking triage, ignore and redaction lists. | An archive that has been scanned before must already have its salt; otherwise the scan stops with a message (the sync itself carries on). | `test_s3_missing_salt_is_never_silently_replaced` |
+| S4 | Info | `user@host` in the report could be rendered as an e-mail link. | Written with `@` as an HTML entity. | `test_attention_first_others_folded_with_links` |
+| S1, S2 | Info | A Claude Code write between `redact` reading and replacing a file could be lost if the session had been idle 10 minutes; a cloud drive's version history keeps the file as it was. | Accepted and documented (the in-use window, and "your drive may keep earlier versions"). | n/a |
+
+Mutation check: each of R1, R2 (both parts), R3 (both parts), R4, R5, R6 (all three parts), R7, R8, R9, R10, S3 and S4 was reverted alone and turned its test red.
+
+### Found by re-scanning the author's archive after the fixes
+
+As after the second review, the report was compared before and after the fixes on the real archive, and three more problems surfaced, all caused by the fixes themselves:
+
+| Finding | Fix | Test |
 |---|---|---|
-| Replacing every occurrence of the value's text, destroying unrelated content (a password that is also a common word) | Replacement by exact position from the match, never a text search | `test_redact_apply_replaces_only_the_value_everywhere_and_sync_keeps_it_out` |
-| The next sync copying the original back from this computer's transcript | `~/.claude/projects` on this computer is redacted too; after a sync, nothing is kept beside the archive copy | same test |
-| Rewriting a transcript under a running session, losing what Claude Code writes next | Local files written in the last 10 minutes are skipped and reported | `test_redact_skips_a_transcript_in_use` |
-| Breaking a transcript | The descriptor contains no quote, backslash or control character; a JSON line that would stop parsing is never written | asserted line by line in the apply test |
-| Acting by accident | Dry run unless `--apply`; arguments must be 12-digit fingerprints | `test_redact_dry_run_changes_nothing`, `test_redact_refuses_something_that_is_not_a_fingerprint` |
-| A sync racing the rewrite | Takes the sync lock | reviewed |
+| Widening values for R2 (so `;` and `,` no longer cut a password short) let a match run through brackets: three SOPS-encrypted values (`ENC[AES256_GCM,data:...]`, safe to store) and a piece of minified JavaScript were reported as passwords of 58 to 163 characters. | Brackets, braces and parentheses end a value again (`;` and `,` still do not, and a trailing one is dropped); `ENC[` is a placeholder, which matters for the quoted form. | `test_encrypted_and_code_values_are_not_secrets` (each of the two rules shown necessary by mutation) |
+| The new leftover check (R2) warned that a redacted local password "still appears 26,886 times": the password is an ordinary word. | Only values with letters and digits, at least 8 characters, are searched for elsewhere; descriptors are excluded. | `test_leftover_check_ignores_an_ordinary_word` |
+| The speed tests measured elapsed time, so they failed when the machine was busy (load average 84 at the time) and could pass a slow version on a fast machine. | They measure the CPU time the tool uses. The quadratic overlap check from the second review now uses 67 s of CPU against a 5 s limit. | `test_f12_many_matches_on_one_line_stay_fast`, `test_long_lines_stay_fast` |
 
-Known limits, documented in the README: other computers' copies and claude.ai's copies are not reached, and there is no undo (a backup would keep the secret).
+### End-to-end test on real data
 
-The new report adds value-free context to each finding (database user and host, or variable name) taken from the match, never from the value, and a test-or-example heuristic that can fold a real credential away if it sits next to the word "test"; your `secrets-triage.json` verdict always wins, and the README says the sorting is a guess. On the author's archive, every folded finding was checked by hand against the repository it came from: all were fixtures, seed or example values, local databases, or a public browser key from a scanned website.
+Run by the author on copies of real transcripts, never the originals, in a sandbox with its own home and archive folders, deleted afterwards. The target was a local development database password that is also an ordinary word, the hardest case for "replace exactly the value": it appears 1,043 times as a credential in 103 transcripts and saved claude.ai copies (159 files counting each computer copy), and its text appears some 27,000 times in all.
 
-Tests: 69, all pass on Python 3.13 and 3.9.6. Mutation check: replacing by text instead of position, removing the in-use skip, redacting the archive only, ignoring the triage file, and removing the local-host rule each turned a test red.
+| Check | 1.3.0 | 1.4.0 |
+|---|---|---|
+| Dry run and `--apply` report the same occurrences and files | 1,043 in 159 files, both | same |
+| Putting the value back in place of every descriptor reproduces each original file byte for byte | all 159 identical | all 159 identical |
+| JSON lines that stopped parsing | 0 | 0 |
+| Other uses of the same word left untouched | yes (count unchanged) | yes |
+| A sync afterwards brings the value back (copies, `versions/`) | no | no |
+| The rescan no longer lists it | yes | yes |
+| `data/redacted.json` records it | (did not exist) | yes |
+| Leftover warning | (did not exist) | first version warned about every use of the ordinary word; fixed so ordinary words are not counted |
+
+Not covered: whether Claude Code can resume a redacted transcript (that would send it to the model); the timestamp comparison in this run was invalid, because the reference copy was made with `cp -R`, which does not keep timestamps, so timestamp preservation rests on its unit test; Windows.
 
 ## Confirmed properties (checked, unchanged)
 
