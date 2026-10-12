@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.6.0 (2026-10-12)
+
+- Memory on every computer: each sync mirrors this computer's memory notes to `all-sessions/memory/<computer>/` and brings here, for projects this computer has, the notes other computers have and this one does not. `memory` lists projects and differences; `memory link <project> <folder> [--apply]` and `memory unlink` join and separate a project that lives elsewhere; `memory forget` drops a note everywhere. Nothing local is overwritten or written through; `MEMORY.md` is merged line by line; a note deleted on one computer is not handed back (recorded by content, per computer); a symlinked or unreadable memory folder is left alone; the home folder is never shared without a link.
+- Setup backup: each sync saves this computer's Claude Code setup (skills, agents, commands, hooks, output styles, `CLAUDE.md`, settings, plugin lists) to `setup/<computer>/`, the newest 10 previous versions per file under `history/`. Each computer gets a stable name and random id at install. Every setup file is scanned for secrets; `redact` covers `setup/`; quoted JSON keys like `"DB_PASSWORD": "..."` are found.
+- `setup restore [--from COMPUTER] [--apply] [--with-hooks]`: explains itself, then (dry run by default) copies setup files you do not have and merges `settings.json`, showing every permission rule; hooks and the status line only with `--with-hooks`, each command printed in full; API helpers, permission mode, safeguard switches and environment variables that redirect requests are never restored automatically, only listed.
+
+The first version of these features was reviewed independently before release (3 High, 6 Medium, 10 Low, 4 Info); everything here is the fixed version (see `securityaudit.md`).
+
 ## 1.5.0 (2026-10-12)
 
 - Shared settings in the archive, `data/settings.json`, created on install and read by every computer: `sync_every_hours`, `scan_secrets_on_sync`, `reminders`, `remind_claude_ai_import_every_days`, `remind_if_sync_older_than_days`. Values are type- and range-checked; an unreadable file means the last good settings.

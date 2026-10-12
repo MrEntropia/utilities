@@ -239,6 +239,57 @@ Small and read-only, so reviewed by the author rather than independently; the ch
 
 Every behaviour above was reverted alone and turned its test red. Checked with Claude Code 2.1.296: a synchronous SessionStart hook's JSON output, including `systemMessage`, is received and recorded as successful (`hook_response` event). That the message appears in the interactive interface rests on Claude Code's documentation, to be confirmed by the first real reminder.
 
+## Fourth review: memory sharing and setup restore (1.6.0, before release)
+
+Date: 2026-10-12. Scope: the first version of memory sharing, the setup backup and `setup restore`, at commit `5236440`, reviewed independently before it was merged; the version released as 1.6.0 is the fixed one. Same method as before: read-only, every finding reproduced with the real CLI in throwaway folders, simulating several computers with different home folders and names on one archive, with fake secrets. The threat model included a hostile or compromised archive (a drive folder someone else can write to). None of the earlier reviews' findings had regressed. The author's computer was switched back to 1.5.0 as soon as the High findings arrived, until the fixes were in; its memory was checked and found untouched.
+
+### High
+
+| # | Finding | Fix | Test |
+|---|---|---|---|
+| H1 | `setup restore` from a hostile archive could install code execution (hooks such as `curl ... \| sh`, status line, `apiKeyHelper`), redirect the API (`ANTHROPIC_BASE_URL`, `NODE_OPTIONS`) and grant full permissions (`defaultMode: bypassPermissions`, `allow: ["Bash"]`); the dry run said only "added a hook". | Hooks, the status line and file-suggestion commands are added only with `--with-hooks`, every command printed in full first; API and credential helpers, `permissions.defaultMode`, `disableAllHooks`, MCP auto-approval, `autoMemoryDirectory` and environment variables that redirect requests or change how programs run are never restored automatically, only listed; every permission rule added is printed; the explanation and README say that whoever writes the archive decides what restore copies. | `test_setup_is_saved_and_restored_safely` |
+| H2 | Restore copied any path under the saved setup into `~/.claude`, including a planted `.credentials.json`, memory notes and plugin caches. | Only paths that belong to a setup item are restored; anything else is counted as ignored. | `test_h2_only_setup_items_are_restored` |
+| H3 | Memory sharing overwrote local notes: on macOS an archived `Rule.md` replaced the local `rule.md`, and a note that was a symlink was written through to a file outside `~/.claude`. | A note that exists here in any letter case, or any path that exists at all (`lexists`, so a symlink too), is never written; the check is made once, where the decision is taken. | `test_h3_case_variant_and_symlinked_note_are_never_written` |
+
+### Medium
+
+| # | Finding | Fix | Test |
+|---|---|---|---|
+| M1 | Edits never reached other computers: they got the first version ever archived of each note and of `MEMORY.md`, so later index lines never arrived. | Each computer mirrors its notes, as they are now, to `all-sessions/memory/<computer>/` (written only by that computer); pulls read the newest copy across computers. | `test_memory_reaches_a_new_computer_and_new_notes_travel_both_ways` |
+| M2 | Two computers with a project at the same path never reported differing copies. | Differences are compared against every other computer's mirror, whatever the path. | `test_a_note_present_here_is_never_overwritten_and_differences_are_listed` |
+| M3 | A symlinked memory folder read as empty, so every note that computer had was recorded as deleted and stopped spreading everywhere. | A memory folder that is a symlink or unreadable is "unknown" and skipped; more than 5 notes vanishing from a project in one run is only reported. | `test_m3_symlinked_memory_folder_is_left_alone_not_mass_forgotten` |
+| M4 | Once a project was shared, `memory link`/`forget` by name failed (two folders matched), and the hints gave commands that failed. | Names resolve to a linked group first; hints use project names. | `test_m4_m5_...`, `test_m4_a_linked_project_is_found_by_its_own_name` |
+| M5 | `memory link` could silently replace another group, or merge two local projects, with no dry run or undo. | Groups have ids; `link` is a dry run without `--apply`, refuses to merge two local projects without `--force`, refuses a folder already linked elsewhere; `memory unlink` added. | `test_link_is_a_dry_run_without_apply`, `test_m4_m5_names_resolve_after_sharing_and_link_refuses_merging_local_projects` |
+| M6 | Setup files without a known suffix (hook scripts, `.env`, `.mjs`) were never scanned; `"DB_PASSWORD": "..."` in JSON was missed; findings in the setup could not be redacted; history grew forever. | Every setup file is scanned whatever its type (binary files skipped silently); quoted keys with a prefix are found; `redact` and the re-applied redactions cover `setup/`; history keeps 10 versions per file. | `test_m6_setup_files_are_scanned_whatever_their_type` |
+
+### Low and Info
+
+| # | Finding | Fix | Test |
+|---|---|---|---|
+| L1 | Deleted notes came back after a corrupt record of seen notes. | An unreadable record counts as a first run (own deletions protected), and is logged. | `test_first_run_with_memory_keeps_earlier_deletions` |
+| L2 | Sync crashed on a non-string entry in that record, or on a deeply nested links file (also any `data/` file). | Entries are filtered by type; `read_data` catches deep nesting. | `test_l2_junk_in_the_seen_file_does_not_stop_memory_sharing`, `test_l2_deeply_nested_links_file_does_not_stop_a_sync` |
+| L3 | Restore copied files before checking the local settings, then said nothing changed; a copy error ended in a traceback. | Settings are read and validated first; each copy is handled separately and failures reported; the closing message says what happened. | reviewed |
+| L4 | The home-folder rewrite matched substrings (`/Users/al` inside `/Users/alice`). | Only a whole path component is rewritten. | `test_l4_home_rewrite_is_by_whole_path` |
+| L5 | Symlinks at the top of the archive's memory and setup folders were followed. | Those folders are refused or skipped when they are symlinks. | reviewed |
+| L6 | The computed project folder name differed from Claude Code's for long paths and emoji, and `link` crashed on very long ones. | The local folder is found from the working directory this computer's own transcripts record; the computed name counts UTF-16 units like Claude Code and is refused over 200 characters with a clear message. | reviewed |
+| L7 | Text from the archive was printed raw (terminal escape sequences). | Every such string is stripped of control characters before printing. | reviewed |
+| L8 | The computer's identity was its network name, which changes on macOS. | A name and random id are fixed at install and used for the setup and memory folders; restore excludes this computer by id. | `test_setup_is_saved_and_restored_safely` (folder name) |
+| L9 | `MEMORY.md` merge copied lines of any length, turned CRLF into LF and appended at the end. | Lines over 300 characters are skipped, control characters removed, the file's own line ending kept, lines inserted after the last existing pointer. | reviewed |
+| L10 | Forgetting was by name and forever; `MEMORY.md` could be forgotten. | Forgetting records the content's SHA-256: a later note with the same name and new content travels; the index cannot be forgotten. | `test_l10_forget_is_by_content_and_refuses_the_index` |
+| I1 | Several computers writing one forgotten file and one links file through the drive could lose entries. | Forgotten notes are per computer (`data/memory-forgotten/<computer>.json`), unioned on read. The links file, written only by `link`, stays a single file. | n/a |
+| I2 | The home folder itself was shared between computers with the same user name. | The home folder is never shared without an explicit link. | `test_i2_home_folder_sessions_are_not_shared_automatically` |
+| I3, I4 | The setup backup keeps files you deleted and skips symlinked items; anyone who can write the archive can put text into every computer's memory. | Documented in the README. | n/a |
+
+### Found while checking the fixes against the author's archive
+
+- The wider patterns (every setup file, quoted keys with a prefix) raised 17 new findings. Checked by context, values hidden: code after a quoted key (`'PRINT_TOKEN_SECRET='))!.slice(...)`), a phrase with spaces, and `from_secret:` in quoted form were being read as secrets; quoted values now stop at whitespace and `from_secret` is excluded in both forms (`test_code_and_references_after_a_quoted_key_are_not_secrets`). The rest were fake values from these reviews and a placeholder in a dry-run command; all recorded in the triage file.
+- Binary files in the setup backup (fonts) were logged as skipped on every sync; they are now recorded once, silently.
+- Two survivors of the mutation check were real gaps: the case-and-symlink guard existed twice (each hid the other; the one at the decision point was kept), and resolving a project through a linked group's own name had no test.
+
+Mutation check: every fix above marked with a test was reverted alone and turned it red.
+
+Tests: 111, all pass on Python 3.13 and 3.9.6.
+
 ## Confirmed properties (checked, unchanged)
 
 - **No network access and no other programs run by the tool.** It imports only standard-library modules for files, JSON, paths and time; no `subprocess`, `urllib`, `http`, sockets beyond reading the computer's own name. Pinned by `test_no_network_or_subprocess_imports`. The installers use the network only to install Python when it is missing (Homebrew, the Linux package manager, or `winget`).

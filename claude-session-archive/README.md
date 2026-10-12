@@ -25,6 +25,8 @@ This tool:
 | Secrets triage | `SECRETS.md` puts what needs attention first and folds away what is probably not live (with the reason); your verdicts in `data/secrets-triage.json` override it | automatic | 1.3 |
 | Shared settings | One `data/settings.json` in the archive that every computer reads: sync interval, secrets scan on or off, reminders | edit the file | 1.5 |
 | Reminders | When a Claude Code session starts and your claude.ai sessions are due to be saved again, or this computer's sync has stopped, a one-line reminder with the steps; `INDEX.md` shows when they were last saved | automatic | 1.5 |
+| Shared memory | Claude Code's memory notes follow your projects to every computer: notes another computer has are brought here on each sync; nothing here is overwritten, and a note you delete is not handed back | automatic, `memory link`, `memory unlink`, `memory forget` | 1.6 |
+| Setup backup and restore | Each sync saves this computer's Claude Code setup (skills, agents, commands, hooks, output styles, `CLAUDE.md`, settings); `setup restore` brings it onto a new computer, explaining first what it will and will not do | automatic, `setup restore` | 1.6 |
 | Redact | Replaces a credential you choose with a `<secret removed: ...>` descriptor in the archive and in this computer's transcripts, and keeps it out on every later sync and import; dry run unless `--apply` | `redact` | 1.3, safeguards 1.4 |
 
 Every feature has been through an independent security review; what each review found, how it was fixed and how it was tested is in [securityaudit.md](securityaudit.md).
@@ -45,11 +47,15 @@ Claude Session Archive/
     secrets-triage.json   your verdict on findings (real, dev, test, example, rotated, not-secret)
     settings.json     shared settings, read by every computer (created on install)
     claude-ai-import.json  when your claude.ai sessions were last imported, and from which computer
+    memory-projects.json   project folders that are the same project on different computers (`memory link`)
+    memory-forgotten/<computer>.json  memory notes deleted on purpose (by content), never handed back
     curated.md        your notes on projects worth keeping; shown at the end of INDEX.md
+  setup/<computer>/   that computer's Claude Code setup (files/, history/<date>/, about.json)
   all-sessions/
     projects/...      copies of every transcript and Claude Code project memory
     computers/<computer>.json   which sessions each computer holds (each computer writes only its own)
     cloud/session_<id>.json     sessions saved from claude.ai with `import`
+    memory/<computer>/<project folder>/   each computer's memory notes as they are now (written only by that computer)
     versions/<computer>/...   any copy that differs from the archived one without simply having grown
                               (e.g. a memory note edited on two computers): kept beside it, never over it
 ```
@@ -113,6 +119,51 @@ claude-session-archive import FILE...  # file sessions exported from claude.ai, 
 claude-session-archive secrets         # scan for credentials, see "Scanning for secrets"
 claude-session-archive redact FP...    # replace chosen credentials with a <descriptor> (dry run unless --apply)
 ```
+
+### Memory on every computer
+
+Claude Code keeps memory notes per project, in `~/.claude/projects/<project folder>/memory/`. Each sync mirrors this computer's notes, as they are now, to `all-sessions/memory/<computer>/` in the archive (only that computer writes there), and brings here, for every project this computer has, the notes your other computers have and this one does not.
+
+- **Same project, same place** (same path on both computers): shared automatically. Sessions started in your home folder itself are never shared without a link.
+- **Same project, different place** (another user name, another folder): link it once, on any computer:
+
+  ```sh
+  claude-session-archive memory                                              # projects with notes, and what would come here
+  claude-session-archive memory link Rocket-scanner ~/code/Rocket-scanner    # dry run: says what it would bring
+  claude-session-archive memory link Rocket-scanner ~/code/Rocket-scanner --apply
+  claude-session-archive memory unlink ~/code/Rocket-scanner                 # stop sharing (notes already here stay)
+  ```
+
+  `link` refuses to join two projects that are both on this computer unless you add `--force`.
+- **Nothing here is ever overwritten.** A note that exists on this computer stays as it is, even if another computer's copy is newer; `memory` lists notes that differ so you can reconcile them by hand. A note is never written through a symlink, and on macOS and Windows a note that differs only in upper and lower case counts as the same note. `MEMORY.md`, the index, is merged: lines pointing to notes this computer now has are added after your own (300 characters at most each), nothing is removed.
+- **A note you delete stays deleted.** Each computer remembers which notes it has had; one that disappears was deleted on purpose: it is not brought back, and its content is recorded in `data/memory-forgotten/<computer>.json` so no other computer hands that version back (a later note with the same name but new content still travels). Other computers keep their own copies. More than a few notes vanishing from one project in one go looks like an accident and is only reported; use `memory forget <project> <note>` to drop a note everywhere on purpose. A memory folder that is a symlink or cannot be read is left alone, never read as "everything deleted".
+- **First run.** On a computer that already had memory before sharing started, notes it deleted earlier are not brought back.
+- **Not supported:** a custom memory location (`autoMemoryDirectory` in settings, or `CLAUDE_CODE_REMOTE_MEMORY_DIR`); sharing is then off.
+
+Anyone who can write to the archive folder can put text into every computer's memory notes, which Claude reads. Keep the archive private.
+
+### Your Claude Code setup on a new computer
+
+Each sync saves this computer's Claude Code setup to `setup/<computer>/` in the archive (the computer is named once at install, with a random id, so a changing network name does not split it): `CLAUDE.md`, `settings.json`, `keybindings.json`, and the `skills`, `agents`, `commands`, `hooks` and `output-styles` folders (and the parked `skills-disabled` and `agents-disabled`), plus the lists of installed plugins and marketplaces. Caches, history, transcripts and credentials are not part of it; `node_modules`, `.git` and files over 5 MB are skipped, and so are symlinked items. A file that changed is replaced and its previous version kept under `setup/<computer>/history/<date>/` (the newest 10 per file). Every file is scanned for secrets, and `redact` covers this folder too. Files you delete are not removed from the backup.
+
+On a new computer, after `install`:
+
+```sh
+claude-session-archive setup restore                       # explains, then shows what it would do
+claude-session-archive setup restore --apply               # copies files, merges settings
+claude-session-archive setup restore --apply --with-hooks  # also adds hooks and the status line
+claude-session-archive setup restore --from <computer> --apply   # if several computers saved a setup
+```
+
+It begins by explaining itself. In short:
+
+- **Files you do not have** are copied into `~/.claude`, and only files that belong to a setup (nothing else in that folder, such as credentials, is ever copied). A file you already have is never overwritten; differing files are listed.
+- **`settings.json` is merged, not copied:** settings this computer lacks are added and every added permission rule is shown; paths in the other computer's home folder are rewritten to this one's; settings you already have are kept; environment variables are listed by name. Your `settings.json` is backed up first. This tool's own hooks are left to `install`.
+- **What runs programs is opt-in:** hooks, the status line and file-suggestion commands are added only with `--with-hooks`, and every command is printed in full in the dry run, under "These run programs on this computer".
+- **What changes where your data goes, or switches safeguards off, is never restored automatically:** API key and credential helpers, `permissions.defaultMode`, `disableAllHooks`, MCP auto-approval, `autoMemoryDirectory`, and environment variables such as `ANTHROPIC_BASE_URL`, `*_PROXY`, `NODE_OPTIONS` or `PATH`. They are listed with their values (except secrets) for you to copy by hand if you trust them.
+- **It does not** sign you in (run `claude` and log in), install plugins (it lists those the other computer had; add them with `/plugin`), or delete anything. Memory notes follow your projects instead.
+
+Only restore from your own archive: whoever can write to that folder decides what this copies.
 
 ### Settings
 
