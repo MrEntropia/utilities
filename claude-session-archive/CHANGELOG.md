@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.6.0 (2026-10-12)
+
+- Memory on every computer: each sync brings here the memory notes your other computers saved for projects this computer has. `memory` lists archived projects and what would come; `memory link <project> <folder>` joins a project that lives elsewhere on this computer; `memory forget` drops a note everywhere. Nothing local is overwritten (differences are listed), `MEMORY.md` is merged line by line, and a note deleted on one computer is not brought back anywhere.
+- Setup backup: each sync saves this computer's Claude Code setup (skills, agents, commands, hooks, output styles, `CLAUDE.md`, settings, plugin lists) to `setup/<computer>/`, keeping previous versions under `history/`. The secrets scan covers it, and now reads script and config files too (`.sh .py .js .ts .yaml .yml .toml .env`).
+- `setup restore [--from COMPUTER] [--apply]`: explains what it does, then (dry run by default) copies the files you do not have, merges `settings.json` (adds only what is missing, rewrites home-folder paths, never shows environment values, backs up first) and lists plugins to install.
+
 ## 1.5.0 (2026-10-12)
 
 - Shared settings in the archive, `data/settings.json`, created on install and read by every computer: `sync_every_hours`, `scan_secrets_on_sync`, `reminders`, `remind_claude_ai_import_every_days`, `remind_if_sync_older_than_days`. Values are type- and range-checked; an unreadable file means the last good settings.

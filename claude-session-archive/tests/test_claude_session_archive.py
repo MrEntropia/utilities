@@ -1116,6 +1116,166 @@ class SettingsAndReminderTests(Base):
         self.assertGreater((self.e.conf / "last-sync").stat().st_mtime, before, "2 h > 1 h setting: it synced")
 
 
+class TwoComputers(unittest.TestCase):
+    """Two computers (different home folders and computer names) sharing one archive."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.archive = root / "drive" / "Archive"
+        (root / "drive").mkdir()
+        self.a = self.computer(root, "alice-old", "/Users/alice")
+        self.b = self.computer(root, "alice-new", "/Users/al")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def computer(self, root, name, fake_home):
+        home = root / name / "home"
+        conf = root / name / "conf"
+        claude = home / ".claude"
+        (claude / "projects").mkdir(parents=True)
+        conf.mkdir(parents=True)
+        return {"home": home, "conf": conf, "claude": claude, "name": name, "fake_home": fake_home}
+
+    def run_on(self, c, *args):
+        env = dict(os.environ, HOME=str(c["home"]), USERPROFILE=str(c["home"]), CLAUDE_CONFIG_DIR=str(c["claude"]),
+                   CLAUDE_SESSION_ARCHIVE_HOME=str(c["conf"]), CLAUDE_SESSION_ARCHIVE_HOSTNAME=c["name"])
+        env.pop("CLAUDE_SESSION_ARCHIVE_PYTHON", None)
+        return subprocess.run([sys.executable, str(SCRIPT), *args], env=env, capture_output=True, text=True)
+
+    def project(self, c, folder):
+        """A project folder on computer c, and Claude Code's folder for it, with one session."""
+        proj = c["home"] / folder
+        proj.mkdir(parents=True, exist_ok=True)
+        slug = re.sub(r"[^A-Za-z0-9-]", "-", str(proj.resolve()))
+        d = c["claude"] / "projects" / slug
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "s1.jsonl").write_text(transcript().replace("/work/proj", str(proj.resolve())), encoding="utf-8")
+        return proj, d
+
+    def note(self, d, name, text):
+        m = d / "memory"
+        m.mkdir(exist_ok=True)
+        (m / name).write_text(text, encoding="utf-8")
+
+    def test_memory_reaches_a_new_computer_through_link_and_sync(self):
+        _, da = self.project(self.a, "Projects/shop")
+        self.note(da, "rule.md", "always A")
+        self.note(da, "MEMORY.md", "# Memory Index\n- [Rule](rule.md) — a rule\n")
+        self.assertEqual(self.run_on(self.a, "install", "--archive", str(self.archive)).returncode, 0)
+        pb, db = self.project(self.b, "code/shop")
+        self.assertEqual(self.run_on(self.b, "install", "--archive", str(self.archive)).returncode, 0)
+        r = self.run_on(self.b, "memory", "link", "shop", str(pb))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual((db / "memory" / "rule.md").read_text(), "always A")
+        self.assertIn("- [Rule](rule.md)", (db / "memory" / "MEMORY.md").read_text())
+        # a note written on B reaches A on A's next sync (link is shared through the archive)
+        self.note(db, "new.md", "from B")
+        self.run_on(self.b, "sync")
+        self.run_on(self.a, "sync")
+        self.assertEqual((da / "memory" / "new.md").read_text(), "from B")
+
+    def test_a_note_present_here_is_never_overwritten(self):
+        _, da = self.project(self.a, "Projects/shop")
+        self.note(da, "rule.md", "version A")
+        self.run_on(self.a, "install", "--archive", str(self.archive))
+        pb, db = self.project(self.b, "code/shop")
+        self.note(db, "rule.md", "version B")
+        self.run_on(self.b, "install", "--archive", str(self.archive))
+        self.run_on(self.b, "memory", "link", "shop", str(pb))
+        self.assertEqual((db / "memory" / "rule.md").read_text(), "version B")
+        self.assertIn("differs: shop/rule.md", self.run_on(self.b, "memory").stdout)
+
+    def test_a_note_deleted_on_purpose_does_not_come_back_anywhere(self):
+        _, da = self.project(self.a, "Projects/shop")
+        self.note(da, "old.md", "stale")
+        self.run_on(self.a, "install", "--archive", str(self.archive))
+        (da / "memory" / "old.md").unlink()  # your own clean-up
+        self.run_on(self.a, "sync")
+        self.run_on(self.a, "sync")
+        self.assertFalse((da / "memory" / "old.md").exists(), "not resurrected from the archive")
+        pb, db = self.project(self.b, "code/shop")
+        self.run_on(self.b, "install", "--archive", str(self.archive))
+        self.run_on(self.b, "memory", "link", "shop", str(pb))
+        self.assertFalse((db / "memory" / "old.md").exists(), "and not handed to the new computer")
+
+    def test_first_run_on_a_computer_with_memory_keeps_earlier_deletions(self):
+        _, da = self.project(self.a, "Projects/shop")
+        self.note(da, "kept.md", "k")
+        archived = self.archive / "all-sessions" / "projects" / da.name / "memory"
+        archived.mkdir(parents=True)
+        (archived / "deleted-long-ago.md").write_text("gone")  # an archive from before memory sharing
+        self.run_on(self.a, "install", "--archive", str(self.archive))
+        self.assertFalse((da / "memory" / "deleted-long-ago.md").exists())
+
+    def test_forget_removes_here_and_stops_it_spreading(self):
+        _, da = self.project(self.a, "Projects/shop")
+        self.note(da, "x.md", "x")
+        self.run_on(self.a, "install", "--archive", str(self.archive))
+        r = self.run_on(self.a, "memory", "forget", "shop", "x.md")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertFalse((da / "memory" / "x.md").exists())
+        forgotten = json.loads((self.archive / "data" / "memory-forgotten.json").read_text())["forgotten"]
+        self.assertTrue(any(k.endswith("/x.md") for k in forgotten), forgotten)
+        self.assertEqual(self.run_on(self.a, "memory", "forget", "shop", "../../etc/passwd").returncode, 1)
+
+    def test_setup_is_saved_and_restored_with_explanation_dry_run_and_merge(self):
+        a = self.a["claude"]
+        (a / "skills" / "deploy").mkdir(parents=True)
+        (a / "skills" / "deploy" / "SKILL.md").write_text("deploy skill")
+        (a / "agents").mkdir()
+        (a / "agents" / "reviewer.md").write_text("A's reviewer")
+        (a / "skills" / "deploy" / "node_modules").mkdir()
+        (a / "skills" / "deploy" / "node_modules" / "big.js").write_text("x")
+        (a / "settings.json").write_text(json.dumps({
+            "env": {"API_TOKEN": "tok-" + "Z" * 20}, "permissions": {"allow": ["Bash(git *)", "Bash(npm *)"]},
+            "statusLine": {"type": "command", "command": self.a["fake_home"] + "/bin/status.sh"},
+            "enabledPlugins": {"helper@market": True}}))
+        self.run_on(self.a, "install", "--archive", str(self.archive))
+        saved = self.archive / "setup" / "alice-old"
+        self.assertTrue((saved / "files" / "skills" / "deploy" / "SKILL.md").exists())
+        self.assertFalse((saved / "files" / "skills" / "deploy" / "node_modules").exists())
+        # about.json records A's real home; make it the fake one to test the rewrite
+        about = json.loads((saved / "about.json").read_text())
+        about["home"] = self.a["fake_home"]
+        (saved / "about.json").write_text(json.dumps(about))
+        b = self.b["claude"]
+        (b / "agents").mkdir()
+        (b / "agents" / "reviewer.md").write_text("B's own reviewer")
+        (b / "settings.json").write_text(json.dumps({"permissions": {"allow": ["Bash(git *)"]}, "theme": "light"}))
+        self.run_on(self.b, "install", "--archive", str(self.archive))
+        before = (b / "settings.json").read_text()
+        dry = self.run_on(self.b, "setup", "restore")
+        self.assertEqual(dry.returncode, 0, dry.stdout + dry.stderr)
+        self.assertIn("What `setup restore` does", dry.stdout)
+        self.assertIn("dry run", dry.stdout)
+        self.assertFalse((b / "skills" / "deploy" / "SKILL.md").exists(), "a dry run changes nothing")
+        self.assertEqual((b / "settings.json").read_text(), before)
+        r = self.run_on(self.b, "setup", "restore", "--apply")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual((b / "skills" / "deploy" / "SKILL.md").read_text(), "deploy skill")
+        self.assertEqual((b / "agents" / "reviewer.md").read_text(), "B's own reviewer", "never overwritten")
+        self.assertIn("agents/reviewer.md", r.stdout)
+        merged = json.loads((b / "settings.json").read_text())
+        self.assertEqual(merged["theme"], "light")
+        self.assertEqual(merged["permissions"]["allow"], ["Bash(git *)", "Bash(npm *)"])
+        self.assertEqual(merged["statusLine"]["command"], str(self.b["home"]) + "/bin/status.sh", "home folder rewritten")
+        self.assertIn("API_TOKEN", merged["env"])
+        self.assertNotIn("Z" * 20, r.stdout + r.stderr, "env values are never shown")
+        self.assertIn("helper@market", r.stdout)
+        self.assertEqual(sum(1 for e in merged["hooks"]["SessionStart"] if "claude_session_archive.py" in json.dumps(e)), 1,
+                         "this tool's hooks are left to install, not duplicated")
+        self.assertTrue(list(b.glob("settings.json.bak-*")), "settings backed up first")
+
+    def test_setup_files_are_scanned_for_secrets(self):
+        (self.a["claude"] / "settings.json").write_text(json.dumps({"env": {"GITHUB_TOKEN": fake("ghp_", 36)}}))
+        self.run_on(self.a, "install", "--archive", str(self.archive))
+        report = (self.archive / "SECRETS.md").read_text(encoding="utf-8")
+        self.assertIn("GitHub token", report)
+        self.assertIn("setup/alice-old/files/settings.json", report)
+
+
 class SourceTests(unittest.TestCase):
     def test_python_38_syntax(self):
         ast.parse(SCRIPT.read_text(encoding="utf-8"), feature_version=(3, 8))

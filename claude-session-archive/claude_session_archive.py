@@ -11,6 +11,8 @@ Commands:
   redact FINGERPRINT...     replace chosen credentials with a <descriptor> (dry run unless --apply)
   status                    show what is configured, and whether the hook can run
   remind                    (run by the hook) say when claude.ai sessions are due to be saved
+  memory [link|forget]      share Claude Code memory notes between your computers
+  setup restore             bring your Claude Code setup (skills, agents, settings) onto this computer
   uninstall                 remove the hook and the installed copy (the archive is left alone)
 
 Standard library only, Python 3.8+. Makes no network requests and runs no other programs:
@@ -35,7 +37,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 CACHE_VERSION = 4  # bump when scan_session() returns new fields, so cached rows are re-read
 LOCK_STALE_SECONDS = 2 * 3600
 RETENTION_DAYS = 36500
@@ -190,6 +192,505 @@ def last_import(archive):
         return None
 
 
+# ---------------------------------------------------------------- memory
+
+MEMORY_GROUPS = "memory-projects.json"     # data/: which archived project folders are the same project
+MEMORY_FORGOTTEN = "memory-forgotten.json"  # data/: notes you deleted on purpose, never pulled back
+MEMORY_SEEN = CONF_DIR / "memory-seen.json"  # notes this computer has had: one missing now was deleted here
+
+
+def claude_slug(path):
+    """The folder name Claude Code gives a project under ~/.claude/projects: its absolute path
+    with every character other than a letter, digit or hyphen turned into a hyphen."""
+    return re.sub(r"[^A-Za-z0-9-]", "-", str(path))
+
+
+def memory_groups(archive):
+    """{project name: [project folder names]}: folders that are the same project on different
+    computers (different user names or paths), linked with `memory link`."""
+    raw = read_data(archive / "data" / MEMORY_GROUPS, "memory projects").get("projects", {})
+    out = {}
+    for name, slugs in raw.items() if isinstance(raw, dict) else []:
+        if isinstance(name, str) and isinstance(slugs, list):
+            out[name] = [x for x in slugs if isinstance(x, str) and re.fullmatch(r"[A-Za-z0-9-]{1,300}", x)]
+    return out
+
+
+def memory_project(slug, groups):
+    """(project name, all folder names of that project) for one folder name."""
+    for name, slugs in groups.items():
+        if slug in slugs:
+            return name, slugs
+    return slug, [slug]
+
+
+def forgotten_notes(archive):
+    raw = read_data(archive / "data" / MEMORY_FORGOTTEN, "forgotten notes").get("forgotten", {})
+    return {k for k in raw if isinstance(k, str)} if isinstance(raw, dict) else set()
+
+
+def memory_note_files(folder):
+    """{relative path: file} of the notes in a memory folder, symlinks and odd names skipped."""
+    out = {}
+    if not folder.is_dir() or folder.is_symlink():
+        return out
+    for path in sorted(folder.rglob("*")):
+        if path.is_symlink() or not path.is_file():
+            continue
+        rel = path.relative_to(folder).as_posix()
+        if all(re.fullmatch(r"[A-Za-z0-9._ -]{1,200}", part) and part not in (".", "..") for part in rel.split("/")):
+            out[rel] = path
+    return out
+
+
+POINTER = re.compile(r"^- \[[^\]\n]{1,300}\]\(([^)\s]{1,300})\)")
+
+
+def merge_memory_index(local_text, other_text, have):
+    """MEMORY.md with every pointer line from another computer's copy added when it points to a
+    note this computer has and does not already list. Nothing is removed or reordered."""
+    listed = {m.group(1) for m in (POINTER.match(l) for l in local_text.splitlines()) if m}
+    extra = []
+    for line in other_text.splitlines():
+        m = POINTER.match(line)
+        if m and m.group(1) not in listed and m.group(1) in have:
+            extra.append(line)
+            listed.add(m.group(1))
+    if not extra:
+        return local_text
+    return local_text.rstrip("\n") + "\n" + "\n".join(extra) + "\n"
+
+
+def memory_pull(archive, apply=True):
+    """Bring onto this computer the memory notes your other computers saved to the archive, for
+    every project this computer has. Only notes missing here are copied; a note that exists here
+    with different content is reported, never overwritten; notes you forgot are skipped.
+    Returns {"pulled": [...], "conflicts": [...], "indexed": n}."""
+    report = {"pulled": [], "conflicts": [], "indexed": 0}
+    src_root = archive / "all-sessions" / "projects"
+    if not PROJECTS.is_dir() or not src_root.is_dir():
+        return report
+    groups = memory_groups(archive)
+    forgotten = forgotten_notes(archive)
+    first_run = not MEMORY_SEEN.exists()
+    try:
+        seen = set(json.loads(MEMORY_SEEN.read_text(encoding="utf-8")))
+    except (OSError, ValueError, TypeError):
+        seen = set()
+    newly_forgotten = {}
+    local_slugs = {p.name for p in PROJECTS.iterdir() if p.is_dir() and not p.is_symlink()}
+    for slug in sorted(local_slugs):
+        name, slugs = memory_project(slug, groups)
+        if len(slugs) == 1 and not (src_root / slug / "memory").is_dir():
+            continue
+        target = PROJECTS / slug / "memory"
+        have = memory_note_files(target)
+        for rel in have:
+            seen.add(f"{slug}/{rel}")
+        if first_run and have:
+            # This computer already had memory for this project before sharing started: whatever
+            # its own archived folder holds that it lacks now was deleted here earlier, not new.
+            for rel in memory_note_files(src_root / slug / "memory"):
+                seen.add(f"{slug}/{rel}")
+        sources = [src_root / s / "memory" for s in slugs]
+        index_texts = []
+        for folder in sources:
+            for rel, path in memory_note_files(folder).items():
+                key = f"{slug}/{rel}"
+                if any(f"{s}/{rel}" in forgotten for s in slugs):
+                    continue
+                if rel not in have and rel != "MEMORY.md" and key in seen:
+                    newly_forgotten[key] = {"date": f"{datetime.now():%Y-%m-%d}", "computer": computer_name(),
+                                            "how": "deleted on this computer"}
+                    continue
+                if rel == "MEMORY.md":
+                    try:
+                        index_texts.append(path.read_text(encoding="utf-8"))
+                    except (OSError, UnicodeDecodeError):
+                        pass
+                    continue
+                dest = target / rel
+                if rel in have:
+                    try:
+                        if dest.read_bytes() != path.read_bytes() and folder.parent.name != slug:
+                            report["conflicts"].append(f"{name}/{rel}")
+                    except OSError:
+                        pass
+                    continue
+                if apply:
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(path, dest)
+                have[rel] = dest
+                report["pulled"].append(f"{name}/{rel}")
+                seen.add(key)
+        if index_texts:
+            idx = target / "MEMORY.md"
+            try:
+                local = idx.read_text(encoding="utf-8") if idx.exists() else "# Memory Index\n"
+            except (OSError, UnicodeDecodeError):
+                continue
+            merged = local
+            for other in index_texts:
+                merged = merge_memory_index(merged, other, set(have))
+            if merged != local:
+                report["indexed"] += merged.count("\n") - local.count("\n")
+                if apply:
+                    target.mkdir(parents=True, exist_ok=True)
+                    write_atomic(idx, merged)
+    report["conflicts"] = sorted(set(report["conflicts"]))
+    report["forgotten"] = sorted(newly_forgotten)
+    if apply:
+        CONF_DIR.mkdir(parents=True, exist_ok=True)
+        write_atomic(MEMORY_SEEN, json.dumps(sorted(seen)))
+        if newly_forgotten:  # a note you deleted here is not handed back to your other computers either
+            data = read_data(archive / "data" / MEMORY_FORGOTTEN, "forgotten notes")
+            rec = data.get("forgotten") if isinstance(data.get("forgotten"), dict) else {}
+            for k, v in newly_forgotten.items():
+                rec.setdefault(k, v)
+            write_atomic(archive / "data" / MEMORY_FORGOTTEN, json.dumps({"forgotten": rec}, indent=2) + "\n")
+    return report
+
+
+def project_label(folder):
+    """A project's own folder name (e.g. "Rocket-scanner"), read from the working directory its
+    transcripts record; the Claude Code folder name if none says."""
+    for path in sorted(folder.glob("*.jsonl"))[:5]:
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                for _ in range(50):
+                    line = fh.readline()
+                    if not line:
+                        break
+                    try:
+                        cwd = json.loads(line).get("cwd")
+                    except (ValueError, AttributeError):
+                        continue
+                    if isinstance(cwd, str) and cwd:
+                        return os.path.basename(cwd.replace("\\", "/").rstrip("/")) or folder.name
+        except OSError:
+            continue
+    home = claude_slug(HOME) + "-"
+    return folder.name[len(home):] if folder.name.startswith(home) and len(folder.name) > len(home) else folder.name
+
+
+def find_archived_project(archive, query, exclude=()):
+    """The archived project folder a name refers to: its folder name, its project name (as
+    `memory` lists it), or a unique ending of the folder name. Folders in `exclude` are ignored."""
+    root = archive / "all-sessions" / "projects"
+    folders = [p for p in sorted(root.iterdir()) if p.is_dir() and p.name not in exclude] if root.is_dir() else []
+    names = [p.name for p in folders]
+    if query in names:
+        return query
+    hits = [p.name for p in folders if project_label(p) == query]
+    if not hits:
+        q = claude_slug(query).strip("-")
+        hits = [n for n in names if n.endswith("-" + q) or n == q]
+    if len(hits) == 1:
+        return hits[0]
+    raise Fail(f"no single archived project matches {query!r}" + (f"; candidates: {', '.join(hits)}" if hits else "")
+               + ". `claude-session-archive memory` lists them.")
+
+
+def cmd_memory(args):
+    archive = archive_dir()
+    if args.action == "link":
+        if not args.args or len(args.args) != 2:
+            raise Fail("usage: memory link <archived project> <folder of that project on this computer>")
+        local = Path(args.args[1]).expanduser().resolve()
+        if not local.is_dir():
+            raise Fail(f"{local} is not a folder")
+        slug = claude_slug(local)
+        src = find_archived_project(archive, args.args[0], exclude={slug})
+        groups = memory_groups(archive)
+        name, slugs = memory_project(src, groups)
+        if name == src:
+            name = project_label(archive / "all-sessions" / "projects" / src)
+        members = sorted(set(slugs) | {src, slug})
+        groups = {k: v for k, v in groups.items() if not set(v) & set(members)}
+        groups[name] = members
+        write_atomic(archive / "data" / MEMORY_GROUPS, json.dumps({"projects": groups}, indent=2) + "\n")
+        (PROJECTS / slug / "memory").mkdir(parents=True, exist_ok=True)
+        r = memory_pull(archive)
+        print(f"linked {local} to {name}; {len(r['pulled'])} note(s) brought here, {r['indexed']} index line(s) added")
+        return 0
+    if args.action == "forget":
+        if not args.args or len(args.args) != 2:
+            raise Fail("usage: memory forget <project> <note file>")
+        groups = memory_groups(archive)
+        slug = find_archived_project(archive, args.args[0])
+        name, slugs = memory_project(slug, groups)
+        rel = args.args[1].strip("/")
+        if not all(re.fullmatch(r"[A-Za-z0-9._ -]{1,200}", part) and part not in (".", "..") for part in rel.split("/")):
+            raise Fail(f"not a note name: {rel!r}")
+        data = read_data(archive / "data" / MEMORY_FORGOTTEN, "forgotten notes")
+        rec = data.get("forgotten") if isinstance(data.get("forgotten"), dict) else {}
+        for s_ in slugs:
+            rec[f"{s_}/{rel}"] = {"date": f"{datetime.now():%Y-%m-%d}", "computer": computer_name()}
+        write_atomic(archive / "data" / MEMORY_FORGOTTEN, json.dumps({"forgotten": rec}, indent=2) + "\n")
+        removed = 0
+        for s in slugs:
+            f = PROJECTS / s / "memory" / rel
+            if f.is_file() and not f.is_symlink():
+                f.unlink()
+                removed += 1
+        print(f"forgot {name}/{rel}: removed here ({removed} file(s)); it will not be brought back to any computer. "
+              "The archive keeps its copy, as it keeps everything. Remove its line from MEMORY.md if it has one.")
+        return 0
+    # status
+    groups = memory_groups(archive)
+    root = archive / "all-sessions" / "projects"
+    seen = set()
+    report = memory_pull(archive, apply=False)
+    print("Archived projects with memory notes (folder names are each computer's path to the project):")
+    for folder in sorted(root.iterdir()) if root.is_dir() else []:
+        notes = memory_note_files(folder / "memory")
+        if not notes or folder.name in seen:
+            continue
+        name, slugs = memory_project(folder.name, groups)
+        seen.update(slugs)
+        label = name if name != folder.name else project_label(folder)
+        here = [s for s in slugs if (PROJECTS / s).is_dir()]
+        hint = "yes" if here else f"no; to bring them here: claude-session-archive memory link {shlex.quote(label)} <its folder on this computer>"
+        print(f"  {label}: {len(notes)} note(s); here: {hint}")
+    print(f"would bring here: {len(report['pulled'])} note(s); differing copies kept as they are: {len(report['conflicts'])}")
+    for c in report["conflicts"][:20]:
+        print(f"  differs: {c}")
+    return 0
+
+
+# ---------------------------------------------------------------- setup backup and restore
+
+# What makes up your Claude Code setup, relative to ~/.claude. Caches, transcripts, history and
+# credentials are not here: transcripts are archived separately, and you sign in again.
+SETUP_ITEMS = ["CLAUDE.md", "settings.json", "keybindings.json", "skills", "skills-disabled", "agents",
+               "agents-disabled", "commands", "hooks", "output-styles", "plugins/installed_plugins.json",
+               "plugins/known_marketplaces.json"]
+SETUP_SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv"}
+SETUP_MAX_FILE = 5 * 1024 * 1024
+
+
+def setup_files(home_claude):
+    """{relative path: file} of the setup files under ~/.claude worth keeping."""
+    out = {}
+    for item in SETUP_ITEMS:
+        base = home_claude / item
+        if base.is_symlink():
+            continue
+        paths = [base] if base.is_file() else sorted(base.rglob("*")) if base.is_dir() else []
+        for path in paths:
+            rel = path.relative_to(home_claude)
+            if path.is_symlink() or not path.is_file() or set(rel.parts) & SETUP_SKIP_DIRS:
+                continue
+            try:
+                if path.stat().st_size > SETUP_MAX_FILE:
+                    continue
+            except OSError:
+                continue
+            out[rel.as_posix()] = path
+    return out
+
+
+def setup_backup(archive, host):
+    """Copy this computer's setup to setup/<computer>/ in the archive. A file that changed is
+    replaced, and its previous version kept under setup/<computer>/history/<date>/."""
+    dest = archive / "setup" / safe_name(host)
+    if (archive / "setup").is_symlink() or dest.is_symlink():
+        raise Fail("setup folder in the archive is a symlink; not writing through it")
+    stamp = f"{datetime.now():%Y-%m-%d}"
+    changed = 0
+    for rel, src in setup_files(CLAUDE_DIR).items():
+        d = dest / "files" / rel
+        try:
+            if d.is_symlink():
+                continue
+            if d.exists():
+                if d.read_bytes() == src.read_bytes():
+                    continue
+                old = dest / "history" / stamp / rel
+                old.parent.mkdir(parents=True, exist_ok=True)
+                if not old.exists():
+                    shutil.copy2(d, old)
+            d.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, d)
+            changed += 1
+        except OSError as exc:
+            log(f"setup: skip {rel}: {type(exc).__name__}")
+    write_atomic(dest / "about.json", json.dumps({"computer": host, "home": str(HOME), "claude_dir": str(CLAUDE_DIR),
+                                                   "saved": datetime.now().isoformat(timespec="seconds"),
+                                                   "os": sys.platform}, indent=2) + "\n")
+    return changed
+
+
+RESTORE_EXPLANATION = """\
+What `setup restore` does
+
+It brings the Claude Code setup you had on another computer onto this one. Each sync saves
+each computer's setup to setup/<computer>/ in your archive: your skills, agents, slash commands,
+hook scripts, output styles, CLAUDE.md and settings.
+
+  * Files you do not have here are copied into ~/.claude. A file you already have is never
+    overwritten; if the two differ, it is listed so you can compare them yourself.
+  * settings.json is merged, not copied. Settings this computer does not have yet are added
+    (permissions, hooks, environment variables, enabled plugins, status line, and so on). Where
+    a setting contains the other computer's home folder, it is rewritten to yours. A setting
+    you already have is left as it is. This tool's own hooks are left to `install`.
+    Environment variables are listed by name only; their values are copied but never shown.
+    Your current settings.json is backed up next to it first.
+  * Nothing is deleted.
+
+What it does not do
+
+  * Sign you in: run `claude` and log in on this computer.
+  * Install plugins: it lists the ones the other computer had; add them with /plugin.
+  * Bring memory notes: those follow your projects (see `claude-session-archive memory`).
+
+Without --apply this is a dry run: it shows what would change and changes nothing.
+"""
+
+
+def setup_sources(archive):
+    root = archive / "setup"
+    out = {}
+    for d in sorted(root.iterdir()) if root.is_dir() else []:
+        try:
+            about = json.loads((d / "about.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(about, dict) and (d / "files").is_dir() and not d.is_symlink():
+            out[d.name] = (d, about)
+    return out
+
+
+def rewrite_home(value, old_home, new_home):
+    """Every string in a settings value, with the other computer's home folder replaced by this one's."""
+    if isinstance(value, str):
+        return value.replace(old_home, new_home) if old_home and old_home != new_home else value
+    if isinstance(value, list):
+        return [rewrite_home(v, old_home, new_home) for v in value]
+    if isinstance(value, dict):
+        return {k: rewrite_home(v, old_home, new_home) for k, v in value.items()}
+    return value
+
+
+def merge_settings(local, other, old_home, new_home):
+    """(merged settings, [lines describing what was added]). Adds only what `local` lacks."""
+    other = rewrite_home(other, old_home, new_home)
+    merged = json.loads(json.dumps(local))
+    notes = []
+    for key, value in other.items():
+        if key == "hooks":
+            continue
+        if key not in merged:
+            merged[key] = value
+            notes.append(f"env: added {', '.join(sorted(value))} (values not shown)" if key == "env" and isinstance(value, dict)
+                         else f"{key}: added")
+        elif isinstance(merged[key], dict) and isinstance(value, dict):
+            added = [k for k in value if k not in merged[key]]
+            for k in added:
+                merged[key][k] = value[k]
+            if added:
+                notes.append(f"{key}: added {', '.join(sorted(added))}" + (" (values not shown)" if key == "env" else ""))
+            for k in [k for k in value if k in merged[key] and isinstance(value[k], list) and isinstance(merged[key][k], list)]:
+                extra = [x for x in value[k] if x not in merged[key][k]]
+                if extra:
+                    merged[key][k] = merged[key][k] + extra
+                    notes.append(f"{key}.{k}: added {len(extra)} entr{'y' if len(extra) == 1 else 'ies'}")
+    hooks = other.get("hooks") if isinstance(other.get("hooks"), dict) else {}
+    for event, entries in hooks.items():
+        if not isinstance(entries, list):
+            continue
+        mine = merged.setdefault("hooks", {}).setdefault(event, []) if isinstance(merged.get("hooks", {}), dict) else None
+        if not isinstance(mine, list):
+            continue
+        for entry in entries:
+            if is_ours(entry) or entry in mine:
+                continue
+            mine.append(entry)
+            notes.append(f"hooks.{event}: added a hook")
+    return merged, notes
+
+
+def cmd_setup(args):
+    if args.action != "restore":
+        raise Fail("usage: setup restore [--from COMPUTER] [--apply]")
+    print(RESTORE_EXPLANATION)
+    archive = archive_dir()
+    sources = setup_sources(archive)
+    here = safe_name(computer_name())
+    if args.source:
+        if args.source not in sources:
+            raise Fail(f"no setup saved from {args.source!r}; saved: {', '.join(sources) or 'none yet'}")
+        name = args.source
+    else:
+        others = [n for n in sources if n != here]
+        if len(others) != 1:
+            listing = "\n  ".join(f"{n} (saved {sources[n][1].get('saved', '?')})" for n in sources) or "(none yet: run a sync on the other computer first)"
+            raise Fail("choose the computer to restore from with --from:\n  " + listing)
+        name = others[0]
+    folder, about = sources[name]
+    old_home = about.get("home") if isinstance(about.get("home"), str) else ""
+    print(f"From: {name}, saved {about.get('saved', '?')}, home folder {old_home or '?'} -> {HOME}\n")
+    files = folder / "files"
+    copied, differ = [], []
+    for path in sorted(files.rglob("*")):
+        if path.is_symlink() or not path.is_file():
+            continue
+        rel = path.relative_to(files).as_posix()
+        if rel in ("settings.json",) or not all(part not in ("..", "") for part in rel.split("/")):
+            continue
+        dest = CLAUDE_DIR / rel
+        if dest.exists() or dest.is_symlink():
+            try:
+                if not dest.is_file() or dest.read_bytes() != path.read_bytes():
+                    differ.append(rel)
+            except OSError:
+                differ.append(rel)
+            continue
+        copied.append(rel)
+        if args.apply:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, dest)
+    groups = {}
+    for rel in copied:
+        groups.setdefault(rel.split("/")[0], []).append(rel)
+    print(("Copied" if args.apply else "Would copy") + f": {len(copied)} file(s)")
+    for top, rels in sorted(groups.items()):
+        print(f"  {top}: {len(rels)}")
+    if differ:
+        print(f"Kept yours (they differ from {name}'s): {len(differ)} file(s)")
+        for rel in differ[:30]:
+            print(f"  {rel}")
+    notes = []
+    other_settings_path = files / "settings.json"
+    if other_settings_path.is_file():
+        try:
+            other = json.loads(other_settings_path.read_text(encoding="utf-8-sig"))
+            if not isinstance(other, dict):
+                raise ValueError("not an object")
+        except ValueError as exc:
+            print(f"settings.json from {name} could not be read ({exc}); left out")
+            other = None
+        if other is not None:
+            local, raw = read_settings()
+            merged, notes = merge_settings(local, other, old_home, str(HOME))
+            print(("Settings merged" if args.apply else "Settings that would be added") + f": {len(notes) or 'none'}")
+            for n in notes:
+                print(f"  {n}")
+            if args.apply and notes:
+                write_settings(merged, raw)
+    plugins = []
+    try:
+        enabled = json.loads(other_settings_path.read_text(encoding="utf-8-sig")).get("enabledPlugins", {})
+        plugins = sorted(k for k, v in enabled.items() if v) if isinstance(enabled, dict) else []
+    except (OSError, ValueError, AttributeError):
+        pass
+    if plugins:
+        print(f"Plugins {name} had enabled (install any you need with /plugin): {', '.join(plugins)}")
+    print("\nDone: nothing was changed. Run again with --apply to do it." if not args.apply else
+          "\nDone. Start a new Claude Code session to pick up the new skills, agents and settings.")
+    return 0
+
+
 # ---------------------------------------------------------------- sync
 
 
@@ -245,6 +746,11 @@ def write_computer_manifest(src, archive_root, host):
     write_atomic(path, json.dumps({"computer": host, "sessions": keys}, indent=1) + "\n")
 
 
+def computer_name():
+    """This computer's name (CLAUDE_SESSION_ARCHIVE_HOSTNAME overrides it, for tests)."""
+    return os.environ.get("CLAUDE_SESSION_ARCHIVE_HOSTNAME") or socket.gethostname()
+
+
 def safe_name(text):
     return re.sub(r"[^A-Za-z0-9._-]", "_", text)[:64] or "host"
 
@@ -276,7 +782,7 @@ def cmd_sync(args):
         return 0
     try:
         STAMP.touch()  # at the start, so session starts during a long sync do not pile up
-        host = socket.gethostname()
+        host = computer_name()
         copied, written = 0, []
         if PROJECTS.is_dir():
             copied = copy_additive(PROJECTS, archive / "all-sessions", host, written)
@@ -285,6 +791,16 @@ def cmd_sync(args):
             enforce_redactions(archive, written)
         except (Fail, OSError, ValueError) as exc:
             log(f"redactions not re-applied: {exc}")
+        try:  # memory notes your other computers saved, for projects this computer has
+            pulled = memory_pull(archive)
+            if pulled["pulled"] or pulled["conflicts"]:
+                log(f"memory: {len(pulled['pulled'])} note(s) brought here, {len(pulled['conflicts'])} differ")
+        except (Fail, OSError, ValueError) as exc:
+            log(f"memory not shared: {exc}")
+        try:
+            setup_backup(archive, host)
+        except (Fail, OSError, ValueError) as exc:
+            log(f"setup not saved: {exc}")
         settings = shared_settings(archive)
         try:  # a failed scan must never stop the archive from being kept
             if settings["scan_secrets_on_sync"]:
@@ -951,7 +1467,7 @@ SECRET_WORDS = ("password", "passwd", "pwd", "secret", "api_key", "apikey", "acc
 NEEDS_RANDOM = ("OpenAI API key",)
 # An unquoted value that is a plain word or a dotted name is code (password: string, process.env.X).
 IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z_]{0,199}|[A-Za-z_][A-Za-z0-9_]{0,99}(?:\.[A-Za-z_][A-Za-z0-9_]{0,99}){1,10}")
-SECRET_SUFFIXES = (".jsonl", ".json", ".md", ".txt")
+SECRET_SUFFIXES = (".jsonl", ".json", ".md", ".txt", ".sh", ".py", ".js", ".ts", ".yaml", ".yml", ".toml", ".env")
 
 
 PASSWORD_KINDS = ("Password or secret assignment", "Database URL with password")
@@ -1096,7 +1612,7 @@ def scan_secrets(archive):
     never a value."""
     root = archive / "all-sessions"
     salt = secrets_salt(archive)
-    version = patterns_version() + hashlib.sha256(salt.encode()).hexdigest()[:8]
+    version = patterns_version() + hashlib.sha256(salt.encode()).hexdigest()[:8] + "+setup"
     try:
         cache = json.loads(SECRETS_CACHE.read_text(encoding="utf-8"))
         if not isinstance(cache, dict) or cache.get("v") != version or cache.get("root") != str(root):
@@ -1105,7 +1621,10 @@ def scan_secrets(archive):
         cache = {}
     old = cache.get("files", {}) if isinstance(cache.get("files"), dict) else {}
     new, files = {}, 0
-    for path in sorted(root.rglob("*")) if root.is_dir() else []:
+    setup = archive / "setup"
+    candidates = (sorted(root.rglob("*")) if root.is_dir() else []) + \
+                 (sorted(setup.rglob("*")) if setup.is_dir() and not setup.is_symlink() else [])
+    for path in candidates:
         if path.is_symlink() or not path.is_file() or path.suffix not in SECRET_SUFFIXES:
             continue
         files += 1
@@ -1653,7 +2172,7 @@ def cmd_import(args):
             problems.append(f"redactions not re-applied: {exc}")
         if counts:  # something was read from an export: this counts as saving your claude.ai sessions
             write_atomic(archive / "data" / "claude-ai-import.json", json.dumps({
-                "last": datetime.now().isoformat(timespec="seconds"), "computer": socket.gethostname(),
+                "last": datetime.now().isoformat(timespec="seconds"), "computer": computer_name(),
                 "sessions": sum(counts.values()), "new": counts.get("new", 0)}, indent=2) + "\n")
     finally:
         try:
@@ -1968,6 +2487,15 @@ def main(argv=None):
     sc.set_defaults(fn=cmd_secrets)
     sub.add_parser("status", help="show configuration").set_defaults(fn=cmd_status)
     sub.add_parser("remind", help="(run by the hook) print a reminder when something is due").set_defaults(fn=cmd_remind)
+    mm = sub.add_parser("memory", help="share memory notes between your computers: status, link, forget")
+    mm.add_argument("action", nargs="?", default="status", choices=["status", "link", "forget"])
+    mm.add_argument("args", nargs="*")
+    mm.set_defaults(fn=cmd_memory)
+    su = sub.add_parser("setup", help="setup restore: bring your Claude Code setup onto this computer")
+    su.add_argument("action", choices=["restore"])
+    su.add_argument("--from", dest="source", help="the computer to restore from (as listed)")
+    su.add_argument("--apply", action="store_true", help="really change ~/.claude")
+    su.set_defaults(fn=cmd_setup)
     sub.add_parser("uninstall", help="remove the hook and installed copy").set_defaults(fn=cmd_uninstall)
     args = p.parse_args(argv)
     try:
