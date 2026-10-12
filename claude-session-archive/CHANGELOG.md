@@ -2,9 +2,11 @@
 
 ## 1.6.0 (2026-10-12)
 
-- Memory on every computer: each sync brings here the memory notes your other computers saved for projects this computer has. `memory` lists archived projects and what would come; `memory link <project> <folder>` joins a project that lives elsewhere on this computer; `memory forget` drops a note everywhere. Nothing local is overwritten (differences are listed), `MEMORY.md` is merged line by line, and a note deleted on one computer is not brought back anywhere.
-- Setup backup: each sync saves this computer's Claude Code setup (skills, agents, commands, hooks, output styles, `CLAUDE.md`, settings, plugin lists) to `setup/<computer>/`, keeping previous versions under `history/`. The secrets scan covers it, and now reads script and config files too (`.sh .py .js .ts .yaml .yml .toml .env`).
-- `setup restore [--from COMPUTER] [--apply]`: explains what it does, then (dry run by default) copies the files you do not have, merges `settings.json` (adds only what is missing, rewrites home-folder paths, never shows environment values, backs up first) and lists plugins to install.
+- Memory on every computer: each sync mirrors this computer's memory notes to `all-sessions/memory/<computer>/` and brings here, for projects this computer has, the notes other computers have and this one does not. `memory` lists projects and differences; `memory link <project> <folder> [--apply]` and `memory unlink` join and separate a project that lives elsewhere; `memory forget` drops a note everywhere. Nothing local is overwritten or written through; `MEMORY.md` is merged line by line; a note deleted on one computer is not handed back (recorded by content, per computer); a symlinked or unreadable memory folder is left alone; the home folder is never shared without a link.
+- Setup backup: each sync saves this computer's Claude Code setup (skills, agents, commands, hooks, output styles, `CLAUDE.md`, settings, plugin lists) to `setup/<computer>/`, the newest 10 previous versions per file under `history/`. Each computer gets a stable name and random id at install. Every setup file is scanned for secrets; `redact` covers `setup/`; quoted JSON keys like `"DB_PASSWORD": "..."` are found.
+- `setup restore [--from COMPUTER] [--apply] [--with-hooks]`: explains itself, then (dry run by default) copies setup files you do not have and merges `settings.json`, showing every permission rule; hooks and the status line only with `--with-hooks`, each command printed in full; API helpers, permission mode, safeguard switches and environment variables that redirect requests are never restored automatically, only listed.
+
+The first version of these features was reviewed independently before release (3 High, 6 Medium, 10 Low, 4 Info); everything here is the fixed version (see `securityaudit.md`).
 
 ## 1.5.0 (2026-10-12)
 
