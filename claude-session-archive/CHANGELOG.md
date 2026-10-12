@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.3.0 (2026-10-12)
+
+- `SECRETS.md` is sorted into **Needs attention** (marked ⚠️) and a folded section (a `<details>` toggle) for findings that are probably not live: short-lived sign-in tokens, local or example database hosts, values only ever next to test, fixture, seed or example text. Each row says where the value came from (database user and host, or variable name, never the value), how many places and sessions hold it, and links to the first transcript (relative path) and to the session on claude.ai. `INDEX.md` shows how many need attention.
+- `data/secrets-triage.json` records your verdict per fingerprint (real, dev, test, example, rotated, not-secret, with a note) and overrides the automatic sorting.
+- `redact FINGERPRINT... [--apply]` replaces chosen credentials with a `<secret removed: ...>` descriptor, in the archive and in this computer's transcripts, at their exact position. Dry run by default; skips transcripts written in the last 10 minutes; never writes a line that would stop being valid JSON.
+- `$(VAR)` references (Kubernetes) are treated as placeholders, not secrets.
+
 ## 1.2.0 (2026-10-11)
 
 - Fixes for every finding of the second security review (F1 to F12, see `securityaudit.md`): no links, images, HTML or auto-linked URLs from session text in the indexes; a malformed saved record no longer stops syncing; `import` never replaces a copy that has events the new one lacks (different copies are kept beside it), survives bad files, caps record size, refuses symlinked folders, takes the sync lock and lists what it adds; the scan finds keys after JSON escapes and `DB_PASSWORD=`-style assignments, fingerprints each private key by its body, keys fingerprints with a salt, shows only the length of passwords and stays fast on lines with thousands of matches; `uninstall` removes every cache.

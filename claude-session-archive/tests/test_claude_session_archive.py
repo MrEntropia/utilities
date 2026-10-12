@@ -701,7 +701,7 @@ class SecretsTests(Base):
             self.assertNotIn(value, report)
             self.assertNotIn(value, r.stdout + r.stderr)
         gh = next(l for l in report.splitlines() if "| GitHub token |" in l)
-        self.assertIn("| 2 |", gh, "the same token in two sessions is one value seen twice")
+        self.assertIn("| 2 | 2 |", gh, "the same token in two sessions is one value seen twice")
         # placeholders are not reported: one real AWS key, one real password assignment
         self.assertEqual(report.count("| AWS access key id |"), 1)
         self.assertEqual(report.count("| Password or secret assignment |"), 1)
@@ -724,7 +724,7 @@ class SecretsTests(Base):
     def test_ignore_list_and_fail_flag(self):
         report = (lambda: (self.e.archive / "SECRETS.md").read_text(encoding="utf-8"))
         self.e.run("secrets")
-        fp = re.search(r"\| GitHub token \| `[^`]+` \| `([0-9a-f]{12})`", report()).group(1)
+        fp = re.search(r"\| GitHub token \|.*`([0-9a-f]{12})` \|$", report(), re.M).group(1)
         (self.e.archive / "data" / "secrets-ignore.json").write_text(json.dumps({"ignore": [fp]}))
         r = self.e.run("secrets", "--fail")
         self.assertEqual(r.returncode, 1)
@@ -749,14 +749,14 @@ class SecretsTests(Base):
         (self.e.conf / "secrets-cache.json").write_text(json.dumps(data))
         self.e.run("secrets")
         gh = next(l for l in (self.e.archive / "SECRETS.md").read_text().splitlines() if "| GitHub token |" in l)
-        self.assertIn("| 1 |", gh, "an unchanged file is served from the cache, not re-read")
+        self.assertIn("| 1 | 1 |", gh, "an unchanged file is served from the cache, not re-read")
         # a grown file is re-read
         p = self.e.archive / "all-sessions" / "projects" / "-work-proj" / "cccc3333.jsonl"
         with open(p, "a", encoding="utf-8") as fh:
             fh.write(line(type="user", timestamp="2026-10-02T10:00:00Z", message={"role": "user", "content": "more"}))
         self.e.run("secrets")
         gh = next(l for l in (self.e.archive / "SECRETS.md").read_text().splitlines() if "| GitHub token |" in l)
-        self.assertIn("| 2 |", gh)
+        self.assertIn("| 2 | 2 |", gh)
 
     def test_long_lines_stay_fast(self):
         self.e.write_session("eeee5555", transcript(prompt="eyJ" + "a" * 400000 + " sk-" + "-" * 300000 + " AKIA" + "Z" * 200000))
@@ -764,6 +764,81 @@ class SecretsTests(Base):
         t = time.time()
         self.assertEqual(self.e.run("secrets").returncode, 0)
         self.assertLess(time.time() - t, 20)
+
+
+class TriageAndRedactTests(Base):
+    def setUp(self):
+        super().setUp()
+        self.real = "postgres://app:" + "Pq7x9Lm2Kd4wZ8" + "@db.prod.example-corp.net:5432/main"
+        self.word = "Pq7x9Lm2Kd4wZ8"
+        self.gh = fake("ghp_", 36)
+        self.e.write_session("aaaa1111", transcript(prompt="connect with " + self.real + " please. Also the word "
+                                                    + self.word + " on its own, and in test fixture: " + self.gh))
+        self.e.write_session("bbbb2222", transcript(prompt="local dev postgres://postgres:Loc4lPass99@localhost:5433/postgres"))
+        old = time.time() - 3600
+        for p in self.e.projects.glob("*.jsonl"):
+            os.utime(p, (old, old))
+        self.assertEqual(self.e.install().returncode, 0)
+        self.e.run("secrets")
+
+    def report(self):
+        return (self.e.archive / "SECRETS.md").read_text(encoding="utf-8")
+
+    def fp(self, kind):
+        return re.search(r"^\|.*\| " + re.escape(kind) + r" \|.*`([0-9a-f]{12})` \|$", self.report(), re.M).group(1)
+
+    def test_attention_first_others_folded_with_links(self):
+        r = self.report()
+        attention, folded = r.split("<details>")
+        self.assertIn("app@db.prod.example-corp.net", attention)
+        self.assertIn("⚠️", attention)
+        self.assertNotIn("postgres@localhost", attention)
+        self.assertIn("local or example database host", folded)
+        self.assertIn("only ever next to test", folded)
+        self.assertIn("](all-sessions/projects/-work-proj/aaaa1111.jsonl)", attention)
+        self.assertIn("**1 need attention**", r)
+        self.assertIn("⚠️ 1 need attention", (self.e.archive / "INDEX.md").read_text(encoding="utf-8"))
+
+    def test_triage_file_moves_a_row(self):
+        fp = self.fp("Database URL with password")
+        (self.e.archive / "data" / "secrets-triage.json").write_text(json.dumps({fp: {"status": "rotated", "note": "done 10-12"}}))
+        self.e.run("secrets")
+        attention, folded = self.report().split("<details>")
+        self.assertNotIn(fp, attention)
+        self.assertIn("rotated: done 10-12", folded)
+
+    def test_redact_dry_run_changes_nothing(self):
+        before = (self.e.projects / "aaaa1111.jsonl").read_bytes()
+        r = self.e.run("redact", self.fp("Database URL with password"))
+        self.assertIn("would replace 2 occurrence(s)", r.stdout)  # archive copy and local transcript
+        self.assertEqual((self.e.projects / "aaaa1111.jsonl").read_bytes(), before)
+
+    def test_redact_apply_replaces_only_the_value_everywhere_and_sync_keeps_it_out(self):
+        fp = self.fp("Database URL with password")
+        r = self.e.run("redact", fp, "--apply")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        for p in (self.e.projects / "aaaa1111.jsonl", self.e.archive / "all-sessions/projects/-work-proj/aaaa1111.jsonl"):
+            text = p.read_text(encoding="utf-8")
+            self.assertNotIn("postgres://app:" + self.word, text)
+            self.assertIn("<secret removed: Database URL with password, app@db.prod.example-corp.net, " + fp + ">", text)
+            self.assertIn(" " + self.word + " on its own", text, "only the matched value is replaced")
+            for line in text.splitlines():
+                json.loads(line)
+        self.e.run("sync")
+        self.assertFalse((self.e.archive / "all-sessions" / "versions").exists(), "nothing brought back beside it")
+        self.assertNotIn(fp, self.report())
+
+    def test_redact_skips_a_transcript_in_use(self):
+        os.utime(self.e.projects / "aaaa1111.jsonl", None)  # just written: a running session
+        r = self.e.run("redact", self.fp("Database URL with password"), "--apply")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("skipped, in use", r.stdout)
+        self.assertIn("postgres://app:" + self.word, (self.e.projects / "aaaa1111.jsonl").read_text())
+
+    def test_redact_refuses_something_that_is_not_a_fingerprint(self):
+        r = self.e.run("redact", "../../etc", "--apply")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("not a fingerprint", r.stdout + r.stderr)
 
 
 class SourceTests(unittest.TestCase):
