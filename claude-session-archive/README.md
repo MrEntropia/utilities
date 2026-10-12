@@ -27,6 +27,7 @@ Claude Session Archive/
     summaries.json    summary, keep note and type per session
     cloud.json        optional details for cloud sessions (claude.ai/code)
     secrets-ignore.json   fingerprints that `secrets` should stop reporting
+    secrets-triage.json   your verdict on findings (real, dev, test, example, rotated, not-secret)
     curated.md        your notes on projects worth keeping; shown at the end of INDEX.md
   all-sessions/
     projects/...      copies of every transcript and Claude Code project memory
@@ -93,6 +94,7 @@ claude-session-archive index           # only rebuild INDEX.md and SESSIONS.md (
 claude-session-archive digest OUTDIR --missing-only   # see "Summaries" below
 claude-session-archive import FILE...  # file sessions exported from claude.ai, see "Sessions on claude.ai"
 claude-session-archive secrets         # scan for credentials, see "Scanning for secrets"
+claude-session-archive redact FP...    # replace chosen credentials with a <descriptor> (dry run unless --apply)
 ```
 
 ### Groups
@@ -226,7 +228,21 @@ claude-session-archive secrets --fail   # also exits 1 if anything is found
 
 It reads every transcript, memory note and saved claude.ai copy in the archive and looks for credentials with a recognisable shape: private keys; Anthropic, OpenAI, Google, Stripe (live), npm, GitLab and GitHub tokens; AWS access key ids; Slack tokens and webhooks; database URLs with a password; JSON Web Tokens; and `password = "..."`-style assignments. Obvious placeholders (`your-api-key`, `xxxxxx`, `${VAR}`, `example`, `test`) are skipped.
 
-`SECRETS.md` lists each distinct value once, **masked**, with a fingerprint, how many places it appears and where it was first seen. Passwords (assignments and the password in a database URL) show only their length; keys show the first few characters of their public format prefix and, if long, the last two. It never contains the value itself, and the tool never changes a transcript.
+`SECRETS.md` opens with a summary (how many values, how many need attention), then:
+
+- **⚠️ Needs attention**: findings that could be live credentials, each with where it came from (the database user and host, or the variable name), its masked value, how many places and sessions hold it, a link to the first transcript it appears in (relative to the archive folder, so it opens in VS Code, Obsidian or any local Markdown viewer) and to the session on claude.ai, and its fingerprint.
+- A folded section (a `<details>` toggle that GitHub, VS Code and Obsidian show as a click-to-expand) with everything that is probably not a live credential, and why: a sign-in token that expires within hours, a local or example database host, a value only ever seen next to test, fixture, seed or example text, or your own verdict.
+
+Each value is **masked**: passwords (assignments and the password in a database URL) show only their length; keys show the first few characters of their public format prefix and, if long, the last two. It never contains the value itself, and the tool never changes a transcript unless you run `redact`.
+
+**Your verdicts.** The automatic sorting is a guess. Record what you found in `data/secrets-triage.json`, and it moves the row and is shown as the reason, on every later scan:
+
+```json
+{ "3f2a9c1b7d4e": { "status": "rotated", "note": "Stripe key rotated 2026-10-12" },
+  "9e8d7c6b5a41": { "status": "test", "note": "fixture in tests/payments" } }
+```
+
+`status` is one of `real` (keeps it under Needs attention), `dev`, `test`, `example`, `rotated`, `not-secret`.
 
 The fingerprint is an HMAC keyed with a random value kept in `data/.secrets-salt`, so it identifies a value across scans and computers without letting someone who has only `SECRETS.md` test guesses against it. Keep the salt with the archive; deleting it changes every fingerprint, so the entries in `data/secrets-ignore.json` stop matching.
 
@@ -237,6 +253,21 @@ For each real credential, **rotate it** with the service that issued it: it is s
 ```json
 { "ignore": ["3f2a9c1b7d4e"] }
 ```
+
+### Replacing a credential with a descriptor
+
+Once a credential is rotated you may still not want it sitting in plain text in every copy of the archive. `redact` replaces it, by fingerprint, with a descriptor such as `<secret removed: Database URL with password, app@db.example-corp.net, 3f2a9c1b7d4e>`:
+
+```sh
+claude-session-archive redact 3f2a9c1b7d4e            # dry run: says what would change
+claude-session-archive redact 3f2a9c1b7d4e --apply    # really change the files
+```
+
+- Only the matched value is replaced, at its exact position: if the password is `postgres`, the word "postgres" elsewhere in the transcript is left alone.
+- It changes the archive **and this computer's `~/.claude/projects`**, because otherwise the next sync would copy the original back. Other computers still have their own copies: run the same command on each of them. claude.ai keeps its own copy of cloud and Remote Control sessions, which this cannot reach.
+- A transcript written to in the last 10 minutes belongs to a running session and is skipped (rewriting it underneath Claude Code would lose what it writes next); run the command again later.
+- A transcript line that would stop being valid JSON is never written; the file is reported and left unchanged.
+- It cannot be undone: there is no backup, because a backup would keep the secret. Rotate first; redact second.
 
 These are pattern matches, not proof. Expect false positives, most often test fixtures: if you work on code that handles credentials, its tests are full of realistic fake keys. Look at the session before rotating anything, and silence fixtures with the ignore list. Do not treat an empty report as a guarantee. A credential with no recognisable shape (a plain password typed into a sentence) will not be found.
 

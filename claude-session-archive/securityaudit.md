@@ -174,6 +174,25 @@ Each fix was reverted alone in a scratch copy and the suite run: F1 bracket esca
 | Test suite, Python 3.13 and 3.9.6 | 63 tests, all pass |
 | Real archive (240 sessions, 2,650 files, about 1.7 GB) | full scan about 4 minutes, then a sync in under a second |
 
+## 1.3.0: triage and `redact` (author's own review, not yet independently reviewed)
+
+`redact` is the first command that changes transcripts, so it was designed against these hazards, each pinned by a test that was shown failing with its guard removed:
+
+| Hazard | Guard | Test |
+|---|---|---|
+| Replacing every occurrence of the value's text, destroying unrelated content (a password that is also a common word) | Replacement by exact position from the match, never a text search | `test_redact_apply_replaces_only_the_value_everywhere_and_sync_keeps_it_out` |
+| The next sync copying the original back from this computer's transcript | `~/.claude/projects` on this computer is redacted too; after a sync, nothing is kept beside the archive copy | same test |
+| Rewriting a transcript under a running session, losing what Claude Code writes next | Local files written in the last 10 minutes are skipped and reported | `test_redact_skips_a_transcript_in_use` |
+| Breaking a transcript | The descriptor contains no quote, backslash or control character; a JSON line that would stop parsing is never written | asserted line by line in the apply test |
+| Acting by accident | Dry run unless `--apply`; arguments must be 12-digit fingerprints | `test_redact_dry_run_changes_nothing`, `test_redact_refuses_something_that_is_not_a_fingerprint` |
+| A sync racing the rewrite | Takes the sync lock | reviewed |
+
+Known limits, documented in the README: other computers' copies and claude.ai's copies are not reached, and there is no undo (a backup would keep the secret).
+
+The new report adds value-free context to each finding (database user and host, or variable name) taken from the match, never from the value, and a test-or-example heuristic that can fold a real credential away if it sits next to the word "test"; your `secrets-triage.json` verdict always wins, and the README says the sorting is a guess. On the author's archive, every folded finding was checked by hand against the repository it came from: all were fixtures, seed or example values, local databases, or a public browser key from a scanned website.
+
+Tests: 69, all pass on Python 3.13 and 3.9.6. Mutation check: replacing by text instead of position, removing the in-use skip, redacting the archive only, ignoring the triage file, and removing the local-host rule each turned a test red.
+
 ## Confirmed properties (checked, unchanged)
 
 - **No network access and no other programs run by the tool.** It imports only standard-library modules for files, JSON, paths and time; no `subprocess`, `urllib`, `http`, sockets beyond reading the computer's own name. Pinned by `test_no_network_or_subprocess_imports`. The installers use the network only to install Python when it is missing (Homebrew, the Linux package manager, or `winget`).

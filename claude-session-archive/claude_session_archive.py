@@ -8,6 +8,7 @@ Commands:
   digest OUTDIR             write one condensed text file per session (for summarising)
   import FILE...            file sessions exported from claude.ai into the archive
   secrets                   scan the archive for credentials; report them masked in SECRETS.md
+  redact FINGERPRINT...     replace chosen credentials with a <descriptor> (dry run unless --apply)
   status                    show what is configured, and whether the hook can run
   uninstall                 remove the hook and the installed copy (the archive is left alone)
 
@@ -33,7 +34,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 CACHE_VERSION = 4  # bump when scan_session() returns new fields, so cached rows are re-read
 STALE_SECONDS = 20 * 3600
 LOCK_STALE_SECONDS = 2 * 3600
@@ -702,8 +703,10 @@ def build_index(archive):
         "A linked session title opens it on claude.ai: a cloud session, or one that had Remote Control on.", "",
     ]
     n_secrets = secrets_summary(archive)
-    if n_secrets:
-        idx += [f"**Secrets:** {n_secrets} credential-shaped value(s) are stored in this archive; see [`SECRETS.md`](SECRETS.md) (values masked).", ""]
+    if n_secrets and n_secrets[0]:
+        flag = f"**⚠️ {n_secrets[1]} need attention**" if n_secrets[1] else "none needs attention"
+        idx += [f"**Secrets:** {n_secrets[0]} credential-shaped value(s) are stored in this archive, {flag}; "
+                f"see [`SECRETS.md`](SECRETS.md) (values masked).", ""]
     idx += [
         f"## All sessions ({len(rows)}: {counts})", "",
     ]
@@ -831,18 +834,19 @@ SECRET_PATTERNS = [
     ("Google API key", re.compile(r"(?<![A-Za-z0-9+/_-])AIza[0-9A-Za-z_-]{35}(?![A-Za-z0-9_-])")),
     ("npm token", re.compile(r"\bnpm_[A-Za-z0-9]{36}")),
     ("Database URL with password", re.compile(
-        r"\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp)://[^:@/\s\"'\\]{1,100}:(?P<value>[^@/\s\"'\\]{3,200})@")),
+        r"\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp)://(?P<user>[^:@/\s\"'\\]{1,100}):(?P<value>[^@/\s\"'\\]{3,200})@"
+        r"(?=(?P<host>[A-Za-z0-9._-]{1,100}))")),
     ("JSON Web Token (usually short-lived)", re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{10,2000}\.eyJ[A-Za-z0-9_-]{10,4000}\.[A-Za-z0-9_-]{10,2000}")),
     ("Password or secret assignment", re.compile(
-        r"(?i)(?<![A-Za-z0-9_])(?!from_secret)(?:[A-Za-z0-9]{1,20}_){0,4}(?:password|passwd|secret|secret_key|secret_access_key|api_key|"
-        r"access_token|auth_token|private_key|client_secret)(?:=|\s{0,3}:\s{1,3})(?P<value>[^\s\"'`\\<>,;(){}\[\]]{8,200})")),
+        r"(?i)(?<![A-Za-z0-9_])(?!from_secret)(?P<name>(?:[A-Za-z0-9]{1,20}_){0,4}(?:password|passwd|secret|secret_key|secret_access_key|api_key|"
+        r"access_token|auth_token|private_key|client_secret))(?:=|\s{0,3}:\s{1,3})(?P<value>[^\s\"'`\\<>,;(){}\[\]]{8,200})")),
     ("Password or secret assignment", re.compile(
-        r"(?i)\b(?:password|passwd|pwd|secret|api_?key|access_?token|auth_?token|client_secret)\\?[\"']?\s{0,3}[:=]\s{0,3}\\?[\"']"
+        r"(?i)\b(?P<name>password|passwd|pwd|secret|api_?key|access_?token|auth_?token|client_secret)\\?[\"']?\s{0,3}[:=]\s{0,3}\\?[\"']"
         r"(?P<value>[^\"'\s\\<>]{8,200})\\?[\"']")),
 ]
 UNQUOTED_ASSIGNMENT = next(rx for k, rx in SECRET_PATTERNS if k == "Password or secret assignment")
 # Values that are obviously not real: placeholders, examples, variable references, masks.
-PLACEHOLDER = re.compile(r"(?i)(?:x{6}|\*{4}|\.{3}|example|placeholder|changeme|your[_-]|<|\$\{|\$[A-Z_]|redacted|dummy|sample|test|correct-horse)")
+PLACEHOLDER = re.compile(r"(?i)(?:x{6}|\*{4}|\.{3}|example|placeholder|changeme|your[_-]|<|\$\{|\$\(|\$[A-Z_]|redacted|dummy|sample|test|correct-horse)")
 # A literal every match of a pattern contains, so a pattern only runs on lines that could match.
 # Lines are lowercased for the check when the anchor is lowercase and the pattern ignores case.
 SECRET_ANCHORS = {
@@ -900,11 +904,22 @@ def looks_random(value):
     return any(c.isdigit() for c in value) and any(c.islower() for c in value) and any(c.isupper() for c in value)
 
 
+TEST_WORDS = re.compile(r"(?i)test|fixture|mock|fake|stub|example|sample|spec\b|seed|dummy|\.example")
+LOCAL_HOSTS = re.compile(r"(?i)^(?:localhost?|127\.\d{1,3}\.\d{1,3}\.\d{1,3}|host|db|database|\S{0,60}\.(?:local|internal|test|example|invalid))$")
+
+
 def find_secrets(line):
     """(kind, value) for each credential in a line; a span already claimed is not matched twice."""
+    for kind, value, _start, _end, _context in find_secret_spans(line):
+        yield kind, value
+
+
+def find_secret_spans(line):
+    """(kind, value, start, end, context) for each credential in a line. start and end locate the
+    value in the line as given; context describes where it was found without containing it."""
     # In transcripts a key often follows a JSON escape such as \\n; the letter would defeat the
-    # word-boundary checks below, so escapes are turned into spaces first.
-    line = line.replace("\\n", " ").replace("\\t", " ").replace("\\r", " ")
+    # word-boundary checks below, so escapes become two spaces (same length, so offsets still match).
+    line = line.replace("\\n", "  ").replace("\\t", "  ").replace("\\r", "  ")
     taken = []
     lower = None
     for kind, rx in SECRET_PATTERNS:
@@ -934,12 +949,23 @@ def find_secrets(line):
                 continue
             if kind == "Password or secret assignment" and not any(c.isdigit() for c in value):
                 continue  # words and phrases (change-me, replace-with-random) are placeholders
-            yield kind, value
+            groups = m.groupdict()
+            where_ = []
+            if groups.get("user") and groups.get("host"):
+                where_.append(f"{groups['user']}@{groups['host']}")
+            if groups.get("name"):
+                where_.append(groups["name"])
+            vstart = m.start("value") if "value" in rx.groupindex else start
+            before = line[max(0, vstart - 300):vstart]
+            context = {"where": " ".join(where_)[:120], "test": bool(TEST_WORDS.search(before)),
+                       "local": bool(groups.get("host") and LOCAL_HOSTS.match(groups["host"]))}
+            yield kind, value, vstart, vstart + len(value), context
 
 
 def patterns_version():
     """Changes whenever a pattern does, so cached scan results never outlive the rules that made them."""
-    text = "|".join(f"{k}={rx.pattern}" for k, rx in SECRET_PATTERNS) + PLACEHOLDER.pattern + repr(NEEDS_RANDOM)
+    text = ("|".join(f"{k}={rx.pattern}" for k, rx in SECRET_PATTERNS) + PLACEHOLDER.pattern + repr(NEEDS_RANDOM)
+            + TEST_WORDS.pattern + LOCAL_HOSTS.pattern + "hit-format-2")
     return hashlib.sha256(text.encode()).hexdigest()[:16]
 
 
@@ -976,8 +1002,12 @@ def scan_secrets(archive):
         try:
             with open(path, encoding="utf-8", errors="replace") as fh:
                 for n, line in enumerate(fh, 1):
-                    for kind, value in set(find_secrets(line)):  # a line often repeats a value
-                        hits.append([fingerprint(value, salt), kind, mask(value, kind), n])
+                    seen = set()  # a line often repeats a value
+                    for kind, value, _s, _e, ctx in find_secret_spans(line):
+                        fp = fingerprint(value, salt)
+                        if fp not in seen:
+                            seen.add(fp)
+                            hits.append([fp, kind, mask(value, kind), n, ctx["where"], ctx["test"], ctx["local"]])
         except OSError as exc:
             log(f"skip {path}: {exc}")
             continue
@@ -991,40 +1021,124 @@ def scan_secrets(archive):
     ignore = {i for i in ignore if isinstance(i, str)}
     found = {}
     for rel in sorted(new):
-        for fp, kind, masked, n in new[rel]["hits"]:
+        for fp, kind, masked, n, where_, test, local in new[rel]["hits"]:
             if fp in ignore:
                 continue
-            h = found.setdefault(fp, {"kind": kind, "masked": masked, "places": []})
+            h = found.setdefault(fp, {"kind": kind, "masked": masked, "places": [], "where": set(),
+                                      "test": 0, "local": 0, "count": 0, "sessions": set()})
+            h["count"] += 1
+            h["test"] += bool(test)
+            h["local"] += bool(local)
+            h["sessions"].add(session_of(rel))
+            if where_:
+                h["where"].add(where_)
             if len(h["places"]) < 1000:
                 h["places"].append(f"{rel}:{n}")
     return files, found
 
 
+def session_of(rel):
+    """The session a file under all-sessions/ belongs to, from the folder layout:
+    projects/<project>/<session>.jsonl (or <session>/subagents/...), cloud/<session>.json,
+    versions/<computer>/<project>/<session>..., cloud/versions/<session>.<hash>.json."""
+    parts = rel.split("/")[1:] if rel.startswith("all-sessions/") else rel.split("/")
+    if parts[:1] == ["versions"]:
+        parts = parts[2:]
+    if parts[:1] == ["projects"] and len(parts) >= 3:
+        name = parts[2]
+    elif parts[:1] == ["cloud"] and len(parts) >= 2:
+        name = parts[-1]
+    else:
+        return ""
+    return name.split(".")[0] if name.split(".")[0] != "memory" else ""
+
+
+TRIAGE_STATUSES = {"real": "you marked it real", "dev": "development value", "test": "test value",
+                   "example": "example or documentation", "rotated": "rotated", "not-secret": "not a secret",
+                   "redacted": "replaced by a descriptor"}
+
+
+def triage_of(h, triage):
+    """("attention" | "unlikely", reason) for one finding. Your data/secrets-triage.json wins."""
+    t = triage.get(h["fp"]) if isinstance(triage.get(h["fp"]), dict) else None
+    if t and t.get("status") in TRIAGE_STATUSES:
+        reason = TRIAGE_STATUSES[t["status"]] + (f": {t['note']}" if isinstance(t.get("note"), str) and t["note"] else "")
+        return ("attention" if t["status"] == "real" else "unlikely"), reason
+    if h["kind"].startswith("JSON Web Token"):
+        return "unlikely", "sign-in token, usually expires within hours"
+    if h["local"] and h["local"] == h["count"]:
+        return "unlikely", "local or example database host"
+    if h["test"] and h["test"] == h["count"]:
+        return "unlikely", "only ever next to test, fixture, seed or example text"
+    return "attention", ""
+
+
+def quote_path(rel):
+    """A relative path as a Markdown link target (spaces and other characters percent-encoded)."""
+    return "".join(c if re.fullmatch(r"[A-Za-z0-9._~/-]", c) else "".join(f"%{b:02X}" for b in c.encode("utf-8")) for c in rel)
+
+
 def write_secrets_report(archive, files, found):
-    order = sorted(found.items(), key=lambda kv: (kv[1]["kind"] == "Password or secret assignment", kv[1]["kind"], -len(kv[1]["places"])))
+    triage = read_data(archive / "data" / "secrets-triage.json", "secrets triage")
+    rows = {r["id"]: r for r in scan_all(archive / "all-sessions" / "projects")} if (archive / "all-sessions" / "projects").is_dir() else {}
+    rows.update({r["id"]: dict(r, cloud=True) for r in scan_saved(archive / "all-sessions" / "cloud")})
+    attention, unlikely = [], []
+    for fp, h in found.items():
+        h["fp"] = fp
+        verdict, reason = triage_of(h, triage)
+        (attention if verdict == "attention" else unlikely).append((h, reason))
+
+    def seen_in(h):
+        sid = session_of(h["places"][0].rsplit(":", 1)[0])
+        r = rows.get(sid, {})
+        rel, line = h["places"][0].rsplit(":", 1)
+        title = clean(r.get("title") or sid or "file", 60)
+        out = f"[{title}]({quote_path(rel)}) (line {line})"
+        url = f"https://claude.ai/code/{sid}" if sid.startswith("session_") else (
+            f"https://claude.ai/code/session_{r['bridge'][4:]}" if r.get("bridge") else "")
+        if url and CLOUD_URL.fullmatch(url):
+            out += f" · [claude.ai]({url})"
+        return out + (f" · {clean(r.get('start', ''))}" if r.get("start") else "")
+
+    def what(h):
+        return clean(", ".join(sorted(h["where"]))[:100]) or ""
+
+    order = lambda pair: (pair[0]["kind"], -len(pair[0]["sessions"]))
     out = [
         "# Secrets found in the archive", "",
         f"Scanned {files} files under `all-sessions/` on {datetime.now():%Y-%m-%d %H:%M}. Do not edit: rebuilt on every sync and by `claude-session-archive secrets`.", "",
-        "Values are masked and never written here. A real credential below has been stored in plain text in every copy of this archive "
-        "(and in `~/.claude` on the computer it came from): **rotate it** with the service that issued it. "
-        "To silence one that is not a secret (a test value), add its fingerprint to `data/secrets-ignore.json` as `{\"ignore\": [\"<fingerprint>\"]}`.", "",
-        f"**{len(found)} distinct value(s)** found." + (" Pattern matches are not proof: check each one." if found else ""), "",
+        f"**{len(found)} distinct value(s)** found: **{len(attention)} need attention**, {len(unlikely)} are probably not live credentials (folded below).", "",
+        "Values are never written here. Passwords show only their length; keys a short public prefix. For a real credential: "
+        "**rotate it** with the service that issued it, then optionally replace it in the archive with "
+        "`claude-session-archive redact <fingerprint>`. Record your verdict in `data/secrets-triage.json` "
+        "(`{\"<fingerprint>\": {\"status\": \"real|dev|test|example|rotated|not-secret\", \"note\": \"...\"}}`); "
+        "it moves the row and stays across scans. Links open the transcript (relative to this folder) and the session on claude.ai.", "",
+        "## ⚠️ Needs attention", "",
     ]
-    if found:
-        out += ["| Kind | Value (masked) | Fingerprint | Occurrences | First seen in |", "|---|---|---|---|---|"]
-        for fp, h in order:
-            out.append(f"| {clean(h['kind'])} | `{clean(h['masked'])}` | `{fp}` | {len(h['places'])} | `{clean(h['places'][0])}` |")
-        out.append("")
+    if attention:
+        out += ["| | Kind | Where it came from | Value | Places | Sessions | First seen in | Fingerprint |", "|---|---|---|---|---|---|---|---|"]
+        for h, reason in sorted(attention, key=order):
+            out.append(f"| ⚠️ | {clean(h['kind'])} | {what(h)} | `{clean(h['masked'])}` | {h['count']} | {len(h['sessions'])} | {seen_in(h)} | `{h['fp']}` |")
+    else:
+        out.append("Nothing. Every finding is classified as not a live credential below.")
+    out += ["", "<details>", f"<summary>Show the {len(unlikely)} findings that are probably not live credentials</summary>", ""]
+    if unlikely:
+        out += ["| Kind | Why it is probably not live | Where it came from | Value | Places | Sessions | First seen in | Fingerprint |",
+                "|---|---|---|---|---|---|---|---|"]
+        for h, reason in sorted(unlikely, key=order):
+            out.append(f"| {clean(h['kind'])} | {clean(reason)} | {what(h)} | `{clean(h['masked'])}` | {h['count']} | {len(h['sessions'])} | {seen_in(h)} | `{h['fp']}` |")
+    out += ["", "</details>", ""]
     write_atomic(archive / "SECRETS.md", "\n".join(out) + "\n")
 
 
 def secrets_summary(archive):
-    """The finding count from the last SECRETS.md, or None if there is none."""
+    """(total, needing attention) from the last SECRETS.md, or None if there is none."""
     try:
-        m = re.search(r"\*\*(\d{1,7}) distinct value", (archive / "SECRETS.md").read_text(encoding="utf-8"))
+        text = (archive / "SECRETS.md").read_text(encoding="utf-8")
     except OSError:
         return None
-    return int(m.group(1)) if m else None
+    m = re.search(r"\*\*(\d{1,7}) distinct value\(s\)\*\* found: \*\*(\d{1,7}) need attention", text)
+    return (int(m.group(1)), int(m.group(2))) if m else None
 
 
 def cmd_secrets(args):
@@ -1040,6 +1154,107 @@ def cmd_secrets(args):
     print(f"{files} files scanned, {len(found)} distinct value(s) found" + (": " + ", ".join(f"{n} {k}" for k, n in sorted(kinds.items())) if kinds else ""))
     print(f"report: {archive / 'SECRETS.md'} (values masked)")
     return 1 if found and args.fail else 0
+
+
+# ---------------------------------------------------------------- redact
+
+IN_USE_SECONDS = 600  # a transcript written this recently may belong to a running session
+
+
+def descriptor(kind, where_, fp):
+    text = f"<secret removed: {kind}" + (f", {where_}" if where_ else "") + f", {fp}>"
+    return re.sub(r'["\\\x00-\x1f]', "", text)  # stays valid inside a JSON string
+
+
+def redact_file(path, targets, salt, apply):
+    """{fingerprint: count} replaced (or that would be) in one file; raises Fail if a line would
+    stop being valid JSON. Only the matched value is replaced, at its exact position."""
+    try:
+        lines = path.read_text(encoding="utf-8").split("\n")
+    except (OSError, UnicodeDecodeError):
+        return {}
+    counts, changed = {}, False
+    for i, line in enumerate(lines):
+        spans = [(st, en, fingerprint(v, salt), k, ctx) for k, v, st, en, ctx in find_secret_spans(line)]
+        spans = [x for x in spans if x[2] in targets]
+        if not spans:
+            continue
+        new = line
+        for st, en, fp, kind, ctx in sorted(spans, reverse=True):
+            new = new[:st] + descriptor(kind, ctx["where"], fp) + new[en:]
+            counts[fp] = counts.get(fp, 0) + 1
+        if path.suffix in (".jsonl", ".json"):
+            try:
+                json.loads(line)
+                was_json = True
+            except (ValueError, RecursionError):
+                was_json = False
+            if was_json:
+                try:
+                    json.loads(new)
+                except (ValueError, RecursionError):
+                    raise Fail(f"{path}: line {i + 1} would not stay valid JSON; file left unchanged")
+        lines[i], changed = new, True
+    if changed and apply:
+        mode = path.stat().st_mode & 0o777
+        write_atomic(path, "\n".join(lines), mode=mode)
+    return counts
+
+
+def cmd_redact(args):
+    """Replace chosen credentials, by fingerprint, with a <descriptor> in the archive and in this
+    computer's transcripts (so the next sync does not bring them back). Dry run unless --apply."""
+    archive = archive_dir()
+    targets = {f.strip().strip("`") for f in args.fingerprints}
+    bad = [f for f in targets if not re.fullmatch(r"[0-9a-f]{12}", f)]
+    if bad:
+        raise Fail(f"not a fingerprint from SECRETS.md: {', '.join(sorted(bad))}")
+    salt = secrets_salt(archive)
+    roots = [archive / "all-sessions", PROJECTS]
+    if not acquire_lock():
+        raise Fail("a sync is running; try again in a minute")
+    totals, files, skipped, problems = {}, 0, [], []
+    try:
+        for root in roots:
+            for path in sorted(root.rglob("*")) if root.is_dir() else []:
+                if path.is_symlink() or not path.is_file() or path.suffix not in SECRET_SUFFIXES:
+                    continue
+                try:
+                    counts = redact_file(path, targets, salt, apply=False)
+                except Fail as exc:
+                    problems.append(str(exc))
+                    continue
+                if not counts:
+                    continue
+                if root == PROJECTS and time.time() - path.stat().st_mtime < IN_USE_SECONDS:
+                    skipped.append(str(path))
+                    continue
+                if args.apply:
+                    redact_file(path, targets, salt, apply=True)
+                files += 1
+                for fp, n in counts.items():
+                    totals[fp] = totals.get(fp, 0) + n
+    finally:
+        try:
+            LOCK.unlink()
+        except OSError:
+            pass
+    verb = "replaced" if args.apply else "would replace"
+    for fp in sorted(targets):
+        print(f"{fp}: {verb} {totals.get(fp, 0)} occurrence(s)")
+    print(f"{files} file(s) {'changed' if args.apply else 'affected'} (archive and this computer's ~/.claude/projects)")
+    for p in skipped:
+        print(f"skipped, in use (changed in the last {IN_USE_SECONDS // 60} minutes): {p}")
+    for p in problems:
+        print(f"problem: {p}")
+    if args.apply:
+        write_secrets_report(archive, *scan_secrets(archive))
+        build_index(archive)
+        print("Other computers still hold their own copies: run the same command there too. "
+              "claude.ai keeps its own copy of cloud and Remote Control sessions.")
+    else:
+        print("Dry run: nothing changed. Add --apply to replace them.")
+    return 1 if problems or skipped else 0
 
 
 # ---------------------------------------------------------------- import
@@ -1449,6 +1664,10 @@ def main(argv=None):
     im = sub.add_parser("import", help="file sessions exported from claude.ai into the archive")
     im.add_argument("files", nargs="+", help="export files (.jsonl, .json, optionally .gz)")
     im.set_defaults(fn=cmd_import)
+    rd = sub.add_parser("redact", help="replace chosen credentials with a <descriptor> (dry run unless --apply)")
+    rd.add_argument("fingerprints", nargs="+", help="fingerprints from SECRETS.md")
+    rd.add_argument("--apply", action="store_true", help="really change the files")
+    rd.set_defaults(fn=cmd_redact)
     sc = sub.add_parser("secrets", help="scan the archive for credentials, report them masked")
     sc.add_argument("--fail", action="store_true", help="exit 1 if anything is found")
     sc.set_defaults(fn=cmd_secrets)
