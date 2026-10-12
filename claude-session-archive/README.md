@@ -12,7 +12,20 @@ This tool:
 2. copies new and grown transcripts to an archive folder once a day, from every computer you install it on, and never deletes or shrinks anything there;
 3. writes two indexes into that folder: `INDEX.md` (one line per session, by group, with its type and where it ran) and `SESSIONS.md` (every session in full: dates, project, where it ran, summary, a "Keep" note, first request, transcript path).
 
-It also brings in sessions that only claude.ai still has: cloud sessions from [claude.ai/code](https://claude.ai/code), and Remote Control sessions whose local transcript was already deleted. That takes one manual export from your browser; see [Sessions on claude.ai](#sessions-on-claudeai). And it can scan everything it keeps for passwords, API keys and other credentials; see [Scanning for secrets](#scanning-for-secrets).
+## Features
+
+| Feature | What it does | Command | Since |
+|---|---|---|---|
+| Keep everything | Stops Claude Code deleting transcripts after 30 days; copies them to your archive daily from every computer, never deleting or shrinking a copy | `install`, then automatic | 1.0 |
+| Index | `INDEX.md` and `SESSIONS.md`: every session by group, with type, summary, a "Keep" note, its first request and its transcript | automatic, `index` | 1.0 |
+| Groups, summaries, types | Your own grouping (`data/groups.json` or a `Group:` title prefix) and summaries (`data/summaries.json`), with condensed digests to write them from | `digest` | 1.0 |
+| Where it ran | The computer, the app (Terminal, Desktop app, VS Code, SDK), Remote Control, and a link to the session on claude.ai | automatic | 1.0 |
+| Sessions on claude.ai | Brings in cloud sessions and Remote Control sessions whose local transcript was already deleted, from an export you make in your browser | `export-claude-ai.js`, `import` | 1.1 |
+| Secrets scan | Finds passwords, API keys, private keys, tokens and database URLs in everything the archive holds, on every sync, and lists them in `SECRETS.md` with values masked | automatic, `secrets` | 1.1, in every sync since 1.2 |
+| Secrets triage | `SECRETS.md` puts what needs attention first and folds away what is probably not live (with the reason); your verdicts in `data/secrets-triage.json` override it | automatic | 1.3 |
+| Redact | Replaces a credential you choose with a `<secret removed: ...>` descriptor in the archive and in this computer's transcripts, and keeps it out on every later sync and import; dry run unless `--apply` | `redact` | 1.3, safeguards 1.4 |
+
+Every feature has been through an independent security review; what each review found, how it was fixed and how it was tested is in [securityaudit.md](securityaudit.md).
 
 ## What you get
 
@@ -231,7 +244,7 @@ It reads every transcript, memory note and saved claude.ai copy in the archive a
 `SECRETS.md` opens with a summary (how many values, how many need attention), then:
 
 - **⚠️ Needs attention**: findings that could be live credentials, each with where it came from (the database user and host, or the variable name), its masked value, how many places and sessions hold it, a link to the first transcript it appears in (relative to the archive folder, so it opens in VS Code, Obsidian or any local Markdown viewer) and to the session on claude.ai, and its fingerprint.
-- A folded section (a `<details>` toggle that GitHub, VS Code and Obsidian show as a click-to-expand) with everything that is probably not a live credential, and why: a sign-in token that expires within hours, a local or example database host, a value only ever seen next to test, fixture, seed or example text, or your own verdict.
+- A folded section (a `<details>` toggle that GitHub, VS Code and Obsidian show as a click-to-expand) with everything that is probably not a live credential, and why: a sign-in token that expires within hours, a local or example database host (`localhost`, `127.x`, `*.local`, `*.test`, `example.com`), a password only ever seen next to the words test, fixture, seed or example in the message, or your own verdict. A key in a live format (Stripe, AWS, GitHub, Anthropic, OpenAI and the like) is never folded because of nearby wording: only your verdict can fold it.
 
 Each value is **masked**: passwords (assignments and the password in a database URL) show only their length; keys show the first few characters of their public format prefix and, if long, the last two. It never contains the value itself, and the tool never changes a transcript unless you run `redact`.
 
@@ -246,7 +259,7 @@ Each value is **masked**: passwords (assignments and the password in a database 
 
 The fingerprint is an HMAC keyed with a random value kept in `data/.secrets-salt`, so it identifies a value across scans and computers without letting someone who has only `SECRETS.md` test guesses against it. Keep the salt with the archive; deleting it changes every fingerprint, so the entries in `data/secrets-ignore.json` stop matching.
 
-What it does not scan: your own `data/` files and `digest` output. `digest` copies the text of your messages, credentials included, so run `secrets` before handing digests to a model.
+What it does not scan: your own `data/` files, `digest` output, and the generated `INDEX.md` and `SESSIONS.md`, which quote each session's first request (up to 160 characters, so a credential pasted at the very start of a session is shown there; they are rebuilt from the transcripts, so a `redact` clears them too). `digest` copies the text of your messages, credentials included, so run `secrets` before handing digests to a model.
 
 For each real credential, **rotate it** with the service that issued it: it is stored in plain text in every copy of the archive and in `~/.claude` on the computer it came from, so deleting it from one file does not make it secret again. For a match that isn't a secret (a test value), add its fingerprint to `data/secrets-ignore.json`:
 
@@ -263,11 +276,12 @@ claude-session-archive redact 3f2a9c1b7d4e            # dry run: says what would
 claude-session-archive redact 3f2a9c1b7d4e --apply    # really change the files
 ```
 
-- Only the matched value is replaced, at its exact position: if the password is `postgres`, the word "postgres" elsewhere in the transcript is left alone.
-- It changes the archive **and this computer's `~/.claude/projects`**, because otherwise the next sync would copy the original back. Other computers still have their own copies: run the same command on each of them. claude.ai keeps its own copy of cloud and Remote Control sessions, which this cannot reach.
-- A transcript written to in the last 10 minutes belongs to a running session and is skipped (rewriting it underneath Claude Code would lose what it writes next); run the command again later.
-- A transcript line that would stop being valid JSON is never written; the file is reported and left unchanged.
-- It cannot be undone: there is no backup, because a backup would keep the secret. Rotate first; redact second.
+- **Exactly the value, nothing else.** It is replaced at the position the scan found it: if the password is `postgres`, the word "postgres" elsewhere in the transcript is untouched. A private key is replaced whole, header to footer, even when a transcript stores it with escaped line breaks. Line endings, permissions and timestamps are kept.
+- **Here and in the archive, together.** It changes the archive and this computer's `~/.claude/projects`. A transcript written to in the last 10 minutes belongs to a running session and is skipped, together with its archive copy; run the command again later.
+- **It stays redacted.** The fingerprints you redact are recorded (without values) in `data/redacted.json`, and every later sync and import re-applies them to whatever it copies: another computer's unredacted transcript, or a newer export from claude.ai, cannot bring the value back into the archive. Other computers' own `~/.claude` still hold the original until you run `redact` there too, and claude.ai keeps its own copy of cloud and Remote Control sessions.
+- **It tells you what it could not do.** If the same text also appears in a form the scan does not recognise (for example a command-line flag such as `mysql -p...`), it says how many times and in which file, without printing it. A file that is not UTF-8 text, a fingerprint that is not found and a file it could not write are each reported, and the exit code is 1.
+- **It never breaks a transcript.** A line that would stop being valid JSON is never written; that file is reported and left as it was.
+- **There is no undo** and no backup, because a backup would keep the secret. Rotate first; redact second. Your cloud drive may still hold earlier versions of a file in its version history or trash.
 
 These are pattern matches, not proof. Expect false positives, most often test fixtures: if you work on code that handles credentials, its tests are full of realistic fake keys. Look at the session before rotating anything, and silence fixtures with the ignore list. Do not treat an empty report as a guarantee. A credential with no recognisable shape (a plain password typed into a sentence) will not be found.
 

@@ -440,6 +440,21 @@ class SyncTests(Base):
         self.assertIn("installed, runnable", self.e.run("status").stdout)
 
 
+def child_cpu_seconds(fn):
+    """CPU time used by the subprocesses fn runs: unlike elapsed time, it does not depend on how
+    busy the machine is, so a speed test measures the code, not the computer."""
+    try:
+        import resource
+    except ImportError:  # Windows: fall back to elapsed time
+        t = time.time()
+        fn()
+        return time.time() - t
+    before = resource.getrusage(resource.RUSAGE_CHILDREN)
+    fn()
+    after = resource.getrusage(resource.RUSAGE_CHILDREN)
+    return (after.ru_utime - before.ru_utime) + (after.ru_stime - before.ru_stime)
+
+
 def fake(prefix, n, alphabet="A1b2C3d4E5f6G7h8J9k0"):
     """A credential-shaped value built at run time, so this file holds nothing that looks real."""
     return prefix + (alphabet * 20)[:n]
@@ -671,9 +686,8 @@ class SecretsReviewTests(Base):
     def test_f12_many_matches_on_one_line_stay_fast(self):
         unit = "-eyJAAAAAAAAAA.eyJAAAAAAAAAA"  # the reviewer's input: thousands of JWT-shaped tokens
         self.e.write_session("bbbb2222", transcript(prompt=unit * (3000000 // len(unit))))
-        t = time.time()
-        self.e.run("sync")  # the sync scans the new file (not from cache)
-        self.assertLess(time.time() - t, 5)
+        used = child_cpu_seconds(lambda: self.e.run("sync"))  # the sync scans the new file (not from cache)
+        self.assertLess(used, 5)
 
 
 class SecretsTests(Base):
@@ -761,9 +775,7 @@ class SecretsTests(Base):
     def test_long_lines_stay_fast(self):
         self.e.write_session("eeee5555", transcript(prompt="eyJ" + "a" * 400000 + " sk-" + "-" * 300000 + " AKIA" + "Z" * 200000))
         self.e.run("sync")
-        t = time.time()
-        self.assertEqual(self.e.run("secrets").returncode, 0)
-        self.assertLess(time.time() - t, 20)
+        self.assertLess(child_cpu_seconds(lambda: self.assertEqual(self.e.run("secrets").returncode, 0)), 20)
 
 
 class TriageAndRedactTests(Base):
@@ -790,14 +802,14 @@ class TriageAndRedactTests(Base):
     def test_attention_first_others_folded_with_links(self):
         r = self.report()
         attention, folded = r.split("<details>")
-        self.assertIn("app@db.prod.example-corp.net", attention)
+        self.assertIn("app&#64;db.prod.example-corp.net", attention)  # "@" as an entity: never an e-mail link
         self.assertIn("⚠️", attention)
-        self.assertNotIn("postgres@localhost", attention)
+        self.assertNotIn("postgres&#64;localhost", attention)
         self.assertIn("local or example database host", folded)
-        self.assertIn("only ever next to test", folded)
+        self.assertIn("| ⚠️ | GitHub token |", attention, "a live-format key is never folded for nearby wording")
         self.assertIn("](all-sessions/projects/-work-proj/aaaa1111.jsonl)", attention)
-        self.assertIn("**1 need attention**", r)
-        self.assertIn("⚠️ 1 need attention", (self.e.archive / "INDEX.md").read_text(encoding="utf-8"))
+        self.assertIn("**2 need attention**", r)
+        self.assertIn("⚠️ 2 need attention", (self.e.archive / "INDEX.md").read_text(encoding="utf-8"))
 
     def test_triage_file_moves_a_row(self):
         fp = self.fp("Database URL with password")
@@ -839,6 +851,162 @@ class TriageAndRedactTests(Base):
         r = self.e.run("redact", "../../etc", "--apply")
         self.assertEqual(r.returncode, 1)
         self.assertIn("not a fingerprint", r.stdout + r.stderr)
+
+
+class RedactReviewTests(Base):
+    """One test per finding of the review of redact (securityaudit.md, R1 to R10)."""
+
+    def setUp(self):
+        super().setUp()
+        self.old = time.time() - 3600
+
+    def put(self, sid, prompt):
+        self.e.write_session(sid, transcript(prompt=prompt))
+        os.utime(self.e.projects / f"{sid}.jsonl", (self.old, self.old))
+
+    def ready(self):
+        self.assertEqual(self.e.install().returncode, 0)
+        self.e.run("secrets")
+        return (self.e.archive / "SECRETS.md").read_text(encoding="utf-8")
+
+    def fp(self, report, kind):
+        return re.search(r"^\|.*\| " + re.escape(kind) + r" \|.*`([0-9a-f]{12})` \|$", report, re.M).group(1)
+
+    def archive_copy(self, sid):
+        return self.e.archive / "all-sessions" / "projects" / "-work-proj" / f"{sid}.jsonl"
+
+    def test_r1_whole_private_key_is_redacted(self):
+        body = [fake("MII", 64, alphabet="Ab3Cd5Ef7Gh9Jk2Lm4Np")] + [fake("", 64, alphabet=a) for a in
+                ("Qr6St8Uv0Wx1Yz3Ab5Cd", "Ef7Gh9Jk2Lm4Np6Qr8St", "Uv0Wx1Yz3Ab5Cd7Ef9Gh")]
+        key = "-----BEGIN RSA PRIVATE KEY-----\n" + "\n".join(body) + "\n-----END RSA PRIVATE KEY-----"
+        self.put("aaaa1111", "my key:\n" + key)
+        fp = self.fp(self.ready(), "Private key")
+        self.assertEqual(self.e.run("redact", fp, "--apply").returncode, 0)
+        for p in (self.e.projects / "aaaa1111.jsonl", self.archive_copy("aaaa1111")):
+            text = p.read_text(encoding="utf-8")
+            for line in body:
+                self.assertNotIn(line, text, "no line of the key survives")
+        self.assertNotIn(fp, (self.e.archive / "SECRETS.md").read_text(encoding="utf-8"))
+
+    def test_r2_value_with_punctuation_is_replaced_whole_and_other_forms_reported(self):
+        self.put("aaaa1111", "DB_PASSWORD=Hunter2024;Zq9!x8Lm and later: mysql -pHunter2024;Zq9!x8Lm db")
+        fp = self.fp(self.ready(), "Password or secret assignment")
+        r = self.e.run("redact", fp, "--apply")
+        text = (self.e.projects / "aaaa1111.jsonl").read_text(encoding="utf-8")
+        self.assertNotIn("DB_PASSWORD=Hunter2024", text)
+        self.assertNotIn("DB_PASSWORD=<secret removed: Password or secret assignment, DB_PASSWORD, " + fp + ">;Zq9", text)
+        self.assertIn("the same text still appears", r.stdout)
+        self.assertNotIn("Hunter2024", r.stdout + r.stderr, "the report never prints the value")
+
+    def test_encrypted_and_code_values_are_not_secrets(self):
+        self.put("aaaa1111", "sops: WOODPECKER_AGENT_SECRET: ENC[AES256_GCM,data:Zm9vYmFy9x,iv:abc123==,tag:x9==,type:str] and "
+                             "minified password},{name:!0,type:String} and DB_PASSWORD=Hunter2024;Zq9x8Lm; done and "
+                             'quoted secret: "ENC[AES256_GCM,data:Zm9vYmFy9x,iv:abc123==,tag:x9==,type:str]"')
+        attention = self.ready().split("<details>")[0]
+        self.assertEqual(attention.count("| ⚠️ |"), 1, attention)  # only DB_PASSWORD
+        self.assertIn("`(18 chars)`", attention, "the trailing ; is not part of the value")
+
+    def test_leftover_check_ignores_an_ordinary_word(self):
+        self.put("aaaa1111", "local postgres://postgres:postgres@db.prod.example-corp.net:5432/postgres uses postgres a lot")
+        fp = self.fp(self.ready(), "Database URL with password")
+        r = self.e.run("redact", fp, "--apply")
+        self.assertNotIn("still appears", r.stdout)
+
+    def test_r3_in_use_transcript_skips_its_archive_copy_too(self):
+        self.put("aaaa1111", "postgres://app:Pq7x9Lm2Kd4wZ8@db.prod.example-corp.net:5432/main")
+        fp = self.fp(self.ready(), "Database URL with password")
+        os.utime(self.e.projects / "aaaa1111.jsonl", None)  # running session
+        r = self.e.run("redact", fp, "--apply")
+        self.assertIn("with its archive copy", r.stdout)
+        self.assertIn("Pq7x9Lm2Kd4wZ8", self.archive_copy("aaaa1111").read_text(encoding="utf-8"),
+                      "the archive copy is not redacted alone")
+
+    def test_r3_sync_reapplies_redactions_to_whatever_it_copies(self):
+        self.put("aaaa1111", "postgres://app:Pq7x9Lm2Kd4wZ8@db.prod.example-corp.net:5432/main")
+        fp = self.fp(self.ready(), "Database URL with password")
+        self.e.run("redact", fp, "--apply")
+        # another computer's unredacted copy of a new session arrives via this computer's projects
+        self.e.write_session("cccc3333", transcript(prompt="again postgres://app:Pq7x9Lm2Kd4wZ8@db.prod.example-corp.net:5432/main"))
+        self.e.run("sync")
+        self.assertNotIn("Pq7x9Lm2Kd4wZ8", self.archive_copy("cccc3333").read_text(encoding="utf-8"))
+        self.assertTrue((self.e.archive / "data" / "redacted.json").exists())
+
+    def test_r4_redact_keeps_timestamps(self):
+        self.put("aaaa1111", "postgres://app:Pq7x9Lm2Kd4wZ8@db.prod.example-corp.net:5432/main")
+        fp = self.fp(self.ready(), "Database URL with password")
+        self.e.run("redact", fp, "--apply")
+        self.assertAlmostEqual((self.e.projects / "aaaa1111.jsonl").stat().st_mtime, self.old, delta=2)
+
+    def test_r5_import_reapplies_redactions(self):
+        self.assertEqual(self.e.install().returncode, 0)
+        rec = json.loads(export_line("session_01Redact000000", text="use postgres://app:Pq7x9Lm2Kd4wZ8@db.prod.example-corp.net/x"))
+        f = Path(self.e.tmp.name) / "a.jsonl"
+        f.write_text(json.dumps(rec) + "\n")
+        self.e.run("import", str(f))
+        self.e.run("secrets")
+        fp = self.fp((self.e.archive / "SECRETS.md").read_text(encoding="utf-8"), "Database URL with password")
+        self.e.run("redact", fp, "--apply")
+        rec["events"].append({"sequence_num": "3", "event_type": "user", "payload": {"message": {"content": "more"}}})
+        f.write_text(json.dumps(rec) + "\n")
+        self.assertIn("1 updated", self.e.run("import", str(f)).stdout)
+        self.assertNotIn("Pq7x9Lm2Kd4wZ8", (self.e.archive / "all-sessions" / "cloud" / "session_01Redact000000.json").read_text())
+
+    def test_r6_latest_or_internal_host_does_not_fold_a_real_credential(self):
+        self.put("aaaa1111", "on the latest build use postgres://app:Pq7x9Lm2Kd4wZ8@db.internal:5432/main")
+        attention = self.ready().split("<details>")[0]
+        self.assertIn("Database URL with password", attention)
+
+    def test_r7_unknown_fingerprint_is_reported(self):
+        self.put("aaaa1111", "nothing here")
+        self.ready()
+        r = self.e.run("redact", "0123456789ab", "--apply")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("not found", r.stdout)
+
+    def test_r9_line_endings_are_preserved(self):
+        self.put("aaaa1111", "postgres://app:Pq7x9Lm2Kd4wZ8@db.prod.example-corp.net:5432/main")
+        p = self.e.projects / "aaaa1111.jsonl"
+        p.write_bytes(p.read_bytes().replace(b"\n", b"\r\n"))
+        os.utime(p, (self.old, self.old))
+        fp = self.fp(self.ready(), "Database URL with password")
+        self.e.run("redact", fp, "--apply")
+        data = p.read_bytes()
+        self.assertEqual(data.count(b"\r\n"), 3)
+        self.assertNotIn(b"Pq7x9Lm2Kd4wZ8", data)
+
+    @unittest.skipUnless(POSIX and os.geteuid() != 0, "POSIX permissions")
+    def test_r8_a_write_failure_is_reported_and_the_rest_continues(self):
+        self.put("aaaa1111", "postgres://app:Pq7x9Lm2Kd4wZ8@db.prod.example-corp.net:5432/main")
+        fp = self.fp(self.ready(), "Database URL with password")
+        folder = self.archive_copy("aaaa1111").parent
+        os.chmod(folder, 0o500)  # the archive copy cannot be rewritten
+        try:
+            r = self.e.run("redact", fp, "--apply")
+        finally:
+            os.chmod(folder, 0o700)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertIn("could not write", r.stdout)
+        self.assertNotIn("Pq7x9Lm2Kd4wZ8", (self.e.projects / "aaaa1111.jsonl").read_text(encoding="utf-8"))
+
+    def test_s3_missing_salt_is_never_silently_replaced(self):
+        self.put("aaaa1111", "postgres://app:Pq7x9Lm2Kd4wZ8@db.prod.example-corp.net:5432/main")
+        self.ready()
+        (self.e.archive / "data" / ".secrets-salt").unlink()
+        r = self.e.run("secrets")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("finish syncing", r.stdout + r.stderr)
+        self.assertFalse((self.e.archive / "data" / ".secrets-salt").exists())
+        self.assertEqual(self.e.run("sync").returncode, 0, "a sync still keeps the archive")
+
+    def test_r10_session_of_layouts(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("csa", SCRIPT)
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        self.assertEqual(m.session_of("all-sessions/versions/host/-p/abc.jsonl"), "abc")
+        self.assertEqual(m.session_of("all-sessions/projects/-p/abc/subagents/x.jsonl"), "abc")
+        self.assertEqual(m.session_of("all-sessions/projects/-p/memory/MEMORY.md"), "")
+        self.assertEqual(m.session_of("all-sessions/cloud/versions/session_01abcdefgh.1234.json"), "session_01abcdefgh")
 
 
 class SourceTests(unittest.TestCase):
