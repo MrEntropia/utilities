@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.2.0 (2026-10-11)
+
+- Fixes for every finding of the second security review (F1 to F12, see `securityaudit.md`): no links, images, HTML or auto-linked URLs from session text in the indexes; a malformed saved record no longer stops syncing; `import` never replaces a copy that has events the new one lacks (different copies are kept beside it), survives bad files, caps record size, refuses symlinked folders, takes the sync lock and lists what it adds; the scan finds keys after JSON escapes and `DB_PASSWORD=`-style assignments, fingerprints each private key by its body, keys fingerprints with a salt, shows only the length of passwords and stays fast on lines with thousands of matches; `uninstall` removes every cache.
+- Every sync runs the secrets scan, incrementally: only new and grown files are read, from a cache that holds fingerprints, masked forms and line numbers, never values, and that resets when the patterns change. `INDEX.md` opens with the count and links `SECRETS.md`. A failed scan never stops a sync.
+
 ## 1.1.0 (2026-10-11)
 
 - `import FILE...`: files sessions exported from claude.ai (gzip or plain JSON Lines, or the older single-object JSON) into `all-sessions/cloud/session_<id>.json`. Session ids are validated before they become file names; an existing copy is only replaced by one holding more events.

@@ -12,8 +12,8 @@ Date: 2026-10-11. Scope: `claude_session_archive.py`, `install.sh`, `install.ps1
 
 | Check | Result |
 |---|---|
-| Test suite, Python 3.9.6 (macOS system Python) | 45 tests, all pass |
-| Test suite, Python 3.13 (Homebrew) | 45 tests, all pass |
+| Test suite, Python 3.9.6 (macOS system Python) | 63 tests, all pass |
+| Test suite, Python 3.13 (Homebrew) | 63 tests, all pass |
 | Python 3.8 syntax (`ast.parse(feature_version=(3, 8))`) | pass |
 | `sh -n install.sh` | pass |
 | Hook format accepted by Claude Code 2.1.296 (a real headless session with an exec-form `SessionStart` hook, both blocking and `async`) | both hooks ran |
@@ -107,6 +107,72 @@ Both handle the most sensitive data the tool touches: a whole export of claude.a
 Mutation check, each reverted alone: masking (red), the placeholder filter (red, after a first version of the test was found unable to fail and was rewritten), the id check (red), the never-shrink rule (red), the local de-duplication (red), the word-boundary and randomness check (red), the base64 boundary on Google keys (red, after a first version of its test was again found unable to fail).
 
 On the author's archive, after importing 181 sessions from claude.ai (2,650 files, about 1.7 GB), the scan takes about 4 minutes. Reviewing the high-value hits by their surrounding text showed them to be test fixtures (the scanner's own exposed-secret detector tests, AWS's published example key) and one match inside base64 image data, which led to the base64 boundary. Earlier, on 2,475 files: 37 distinct values found in about 2 minutes, after the false-positive fixes removed 7 (six hyphenated words read as OpenAI keys, and one well-known example password) and the duplicate counting was fixed. `export-claude-ai.js` is not covered by the Python tests; the same requests, run as an inline script, exported 183 sessions from a real account, but the published file itself has not been run end to end.
+
+## Second review: 1.1.0 (import, saved sessions, secrets scan, export script)
+
+Date: 2026-10-11. Scope: everything added after the first review, at commit `a189197`: `import`, indexing of sessions saved from claude.ai, the `secrets` command, `digest` over saved copies, and `export-claude-ai.js`. Same method as the first review: an independent reviewer read the code (read-only), reproduced each finding by running the real CLI against throwaway folders with fake secrets, and suggested fixes. Every fix below is pinned by a test, and every test was shown failing with its fix reverted (results at the end of this section).
+
+### Medium
+
+| # | Finding | Fix (1.2.0) | Test |
+|---|---|---|---|
+| F1 | Text from an imported export (title, repository, branch, first request, and dates, which were written unescaped) could put Markdown links, remote images and raw HTML into `INDEX.md` and `SESSIONS.md`, breaking "links point only to claude.ai". Dates from local transcripts had the same gap. | `clean()` now escapes backslash, `[`, `]` and backtick everywhere, and writes `://` and `www.` in quoted text as HTML entities, so a bare URL looks the same but is never auto-linked. Dates are accepted only as `YYYY-MM-DD`. The only links left are the ones the tool builds, to claude.ai, and `link()` re-checks them. | `test_f1_no_links_images_or_html_from_imported_text` |
+| F2 | One malformed saved record (`config.outcomes` not a list, or JSON nested 100,000 deep) raised an uncaught error: every later sync crashed, silently, because the hook is asynchronous. | Reading a saved record is wrapped: an unreadable one is skipped and logged; types are checked before iterating. | `test_f2_malformed_saved_record_does_not_stop_the_index` |
+| F3 | "Replace only when the new copy has more events" lost data: a junk record with more events replaced a complete copy, and an unreadable copy was overwritten by anything. | A copy is replaced only when every one of its events (by event id) is in the new one. Any other different copy, and anything arriving for an unreadable copy, is kept beside it under `all-sessions/cloud/versions/`. | `test_f3_a_different_copy_is_kept_beside_never_over`, `test_f3_a_grown_copy_replaces` |
+| F4 | The scan missed credentials systematically: any key right after a JSON `\n` or `\t` escape (the letter defeated the boundary checks), and `DB_PASSWORD=`, `SECRET_KEY=`, unquoted `PASSWORD=` and YAML `password:` forms. | JSON escapes are turned into spaces before matching; a new pattern covers environment and YAML assignments, ignoring values that are plain words or dotted names (`process.env.X`, `string`). | `test_f4_keys_after_json_escapes_and_env_assignments_found` |
+| F5 | Every private key of one type had the same fingerprint (only the header was hashed), so ignoring one test key silenced every real one. | The fingerprint covers the key body; a header with no key after it is a mention, not a finding. | `test_f5_each_private_key_has_its_own_fingerprint` |
+| F6 | The README's `import ~/Downloads/claude-ai-sessions-*` wildcard would import any similarly named file a website dropped into Downloads (combined with F1 and F2: injected entries and a stopped sync). | The README now names the files; `import` refuses records without the structure the export script writes and lists the title of every session it adds. F1 and F2 remove the rest of the impact. | `test_f6_records_without_export_structure_are_skipped` |
+
+### Low
+
+| # | Finding | Fix (1.2.0) | Test |
+|---|---|---|---|
+| F7 | `SECRETS.md` alone was an offline guess-checker: an unsalted 48-bit SHA-256 prefix plus the mask recovered a weak database password from a list of guesses in a millisecond, and a 13-character password showed 6 characters. | Fingerprints are HMAC-SHA-256 keyed with a random 256-bit salt kept in the archive (`data/.secrets-salt`), stable across computers. Passwords show only their length; keys show a short public prefix. | `test_f7_fingerprints_are_keyed_and_short_values_barely_shown` |
+| F8 | `import` crashed with a traceback on a truncated gzip, non-UTF-8 text, a byte-order mark, an indented `{"sessions": [...]}` file or a folder, after filing part of it and without rebuilding the index. | Each file is read defensively: problems are reported per file, the sessions before a fault are kept, the next file is processed, and the index is always rebuilt. Byte-order marks and indented JSON are accepted. | `test_f8_bad_files_report_a_problem_not_a_traceback` |
+| F9 | Memory was unbounded: a 0.29 MB compressed file grew to 1 GB in memory. | Lines are read with a 256 MB cap per session record (the largest seen in practice is about 10 MB); a longer record is reported and skipped. | `test_f9_oversized_record_is_refused` |
+| F10 | If `all-sessions/cloud` was a symlink, `import` wrote outside the archive. | `import` refuses to write through a symlinked `all-sessions` or `all-sessions/cloud`, and skips any destination that is not a regular file. | `test_f10_symlinked_cloud_folder_refused` |
+| F11 | `uninstall` left `saved-cache.json` (session titles and first requests) behind. | All caches are removed. | `test_f11_uninstall_removes_every_cache` |
+| F12 | About 4 s per MB on content made of thousands of JWT-shaped tokens. | Profiling showed the cost was not the regex but the overlap check between matches, which compared each match with every earlier one. It now uses a sorted list and binary search: the reviewer's input went from 3.2 s to 0.13 s per MB with the same results. JWTs also start only at a token boundary. | `test_f12_many_matches_on_one_line_stay_fast` |
+
+### Smaller items
+
+| Finding | Outcome |
+|---|---|
+| A `cloud.json` link with `?query` or `#fragment` listed the session twice | Fixed: the id is taken from the path. `test_cloud_url_with_query_is_listed_once` |
+| The placeholder filter looked at the whole database URL, so a user named `test_runner` hid a real password | Fixed: only the password is checked and fingerprinted. Covered by `test_finds_each_kind_and_never_writes_the_value`, which now uses that user name |
+| Every non-cloud saved session was labelled Remote Control | Fixed: the label follows the session's recorded kind |
+| A backtick could break the table layout | Fixed (escaped); asserted in the F1 test |
+| `import` took no lock against a running sync | Fixed: it takes the sync lock |
+| Cached rows were trusted when `digest` built a path from them | Fixed: the saved file name is re-validated |
+| `digest` copies credentials into its output; `data/` and digests are not scanned | Accepted and documented in the README (run `secrets` before handing digests to a model) |
+| "First seen in" is always line 1 for a saved copy, which is one long line | Accepted; the file still identifies the session |
+| The placeholder words can hide a real value containing them (`Contest2024!`) | Accepted: the trade against noise is documented ("pattern matches, not proof") |
+
+### Found while checking the fixes against the real archive
+
+Re-scanning the author's archive after the fixes, and comparing with the previous report, found two more problems; both are fixed and pinned:
+
+| Finding | Fix | Test |
+|---|---|---|
+| Google API keys dropped from 3 to 0. The base64 boundary added in 1.1.0 (to stop false hits inside image data) also refused a key after `=`, which is exactly how keys appear in URLs (`?key=AIza...`). This was a false negative introduced by our own earlier fix, and no test covered the common form. | `=` removed from the boundary; base64 padding never precedes more key characters. | `test_google_key_in_a_url_query_is_found` |
+| The new F4 assignment pattern raised password findings from 5 to 23, most of them noise: Woodpecker `from_secret: <name>` references, placeholder phrases (`BETTER_AUTH_SECRET=replace-with-...`) and empty assignments followed by the next word. | `from_secret` excluded; `KEY=` must be followed directly by the value (YAML `key: value` still allowed); an assignment value must contain a digit. A real password made only of letters is now missed; the README says pattern matching is not a guarantee. | `test_assignment_noise_is_not_reported` |
+
+The lesson for the next change to the patterns: compare the report before and after on a real archive, not only the tests. Both problems were visible only as a change in the counts.
+
+### export-claude-ai.js
+
+The reviewer read it but did not run it, and confirmed it only makes same-origin GET requests to claude.ai and only writes downloads to disk: no other host, no POST, no storage. Changes: it releases each file's memory after saving it, says how many files to expect, and explains Chrome's "download multiple files" prompt, which on the author's first run held back seven of eight files until it was allowed (they arrived intact afterwards). The README tells users to paste only the file from this repository, since a modified copy would run with their claude.ai sign-in. The reviewer doubted that `response_shape` is the right field; it is: the author's run returned real titles, dates and repositories through it. The script still has no automated test, and the endpoints it reads are undocumented, so it can stop working without notice.
+
+### Mutation check (second review)
+
+Each fix was reverted alone in a scratch copy and the suite run: F1 bracket escaping, F1 URL defanging, F1 date validation, F2, F3, F4 escapes, F4 code-like values, F5, F7 keyed fingerprint, F7 password masks, F6 structure check, F6 title list, F8, F9, F10, F11, F12, the database-password value, the query-string id and the backtick escape all turned a test red. Two tests were found unable to fail on the first try and were rewritten until they could: F12 (the scan had already been served from the cache) and the backtick (no test touched it).
+
+### Results
+
+| Check | Result |
+|---|---|
+| Test suite, Python 3.13 and 3.9.6 | 63 tests, all pass |
+| Real archive (240 sessions, 2,650 files, about 1.7 GB) | full scan about 4 minutes, then a sync in under a second |
 
 ## Confirmed properties (checked, unchanged)
 

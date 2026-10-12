@@ -470,7 +470,9 @@ class ImportTests(Base):
             fh.write(json.dumps({"id": "session_01NoEvents333"}) + "\n")
         r = self.e.run("import", str(export))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertIn("2 new, 0 updated, 0 unchanged, 2 skipped", r.stdout)
+        self.assertIn("2 new, 0 updated, 0 unchanged, 0 kept beside, 2 skipped", r.stdout)
+        self.assertIn("  + Recovered work", r.stdout)
+        self.assertIn("delete them", r.stdout)
         self.assertEqual(sorted(p.name for p in self.saved.iterdir()),
                          ["session_01CloudOne22222.json", "session_01RecoveredOne1.json"])
         idx = (self.e.archive / "INDEX.md").read_text(encoding="utf-8")
@@ -509,6 +511,171 @@ class ImportTests(Base):
                       (self.e.archive / "SESSIONS.md").read_text(encoding="utf-8"))
 
 
+class ReviewTests(Base):
+    """One test per finding of the 1.1 review (securityaudit.md, F1 to F12)."""
+
+    def setUp(self):
+        super().setUp()
+        self.e.write_session("aaaa1111", transcript())
+        self.assertEqual(self.e.install().returncode, 0)
+        self.saved = self.e.archive / "all-sessions" / "cloud"
+        self.tmp = Path(self.e.tmp.name)
+
+    def imp(self, *records, name="e.jsonl", extra_env=None):
+        f = self.tmp / name
+        f.write_text("".join(r if isinstance(r, str) else json.dumps(r) + "\n" for r in records), encoding="utf-8")
+        return self.e.run("import", str(f), extra_env=extra_env)
+
+    def test_f1_no_links_images_or_html_from_imported_text(self):
+        rec = json.loads(export_line("session_01Hostile0000", title="[click](https://evil.example) ![i](https://evil.example/p.png) `code",
+                                     created="<img src=x onerror=alert(1)>", repo="[r](https://evil.example)",
+                                     text="see [here](https://evil.example)"))
+        self.imp(rec)
+        for name in ("INDEX.md", "SESSIONS.md"):
+            text = (self.e.archive / name).read_text(encoding="utf-8")
+            self.assertNotIn("https://evil", text, name)  # not even as a bare, auto-linked URL
+            self.assertNotIn("<img", text, name)
+            self.assertIn("\\`code", text, name)  # a backtick cannot open a code span across cells
+
+    def test_f2_malformed_saved_record_does_not_stop_the_index(self):
+        self.saved.mkdir(parents=True)
+        bad = json.loads(export_line("session_01BadShape000"))
+        bad["metadata"]["config"]["outcomes"] = 1
+        (self.saved / "session_01BadShape000.json").write_text(json.dumps(bad))
+        (self.saved / "session_01DeepNest0000.json").write_text('{"events": [' + "[" * 100000 + "]" * 100000 + "]}")
+        self.imp(export_line("session_01GoodOne00000", title="Still listed"))
+        r = self.e.run("sync")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertIn("Still listed", (self.e.archive / "INDEX.md").read_text(encoding="utf-8"))
+
+    def test_f3_a_different_copy_is_kept_beside_never_over(self):
+        self.imp(export_line("session_01Keep11111111"))
+        junk = json.loads(export_line("session_01Keep11111111"))
+        junk["events"] = [{"sequence_num": str(i), "event_type": "system", "payload": {}} for i in range(10, 20)]
+        r = self.imp(junk)
+        self.assertIn("1 kept beside", r.stdout)
+        kept = json.loads((self.saved / "session_01Keep11111111.json").read_text())
+        self.assertEqual(len(kept["events"]), 2, "the original stays in place")
+        self.assertEqual(len(list((self.saved / "versions").glob("session_01Keep11111111.*.json"))), 1)
+        (self.saved / "session_01Unread000000.json").write_text("{not json")
+        self.imp(export_line("session_01Unread000000"))
+        self.assertEqual((self.saved / "session_01Unread000000.json").read_text(), "{not json")
+
+    def test_f3_a_grown_copy_replaces(self):
+        self.imp(export_line("session_01Grow00000000"))
+        grown = json.loads(export_line("session_01Grow00000000"))
+        grown["events"].append({"sequence_num": "3", "event_type": "user", "payload": {"message": {"content": "more"}}})
+        self.assertIn("1 updated", self.imp(grown).stdout)
+
+    def test_f8_bad_files_report_a_problem_not_a_traceback(self):
+        good = export_line("session_01Fine00000000")
+        gz = self.tmp / "trunc.jsonl.gz"
+        with gzip.open(gz, "wt", encoding="utf-8") as fh:
+            fh.write(good * 50)
+        gz.write_bytes(gz.read_bytes()[:-30])
+        bom = self.tmp / "bom.jsonl"
+        bom.write_bytes(b"\xef\xbb\xbf" + export_line("session_01Bom000000000").encode())
+        pretty = self.tmp / "pretty.json"
+        pretty.write_text(json.dumps({"sessions": [json.loads(export_line("session_01Pretty000000"))]}, indent=2))
+        latin = self.tmp / "latin.jsonl"
+        latin.write_bytes(b"\xff\xfe not utf-8\n")
+        r = self.e.run("import", str(gz), str(bom), str(pretty), str(latin), str(self.tmp))
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("problem:", r.stdout)
+        for sid in ("session_01Fine00000000", "session_01Bom000000000", "session_01Pretty000000"):
+            self.assertTrue((self.saved / f"{sid}.json").exists(), sid)
+        self.assertIn("sessions indexed", r.stdout)
+
+    def test_f6_records_without_export_structure_are_skipped(self):
+        r = self.imp({"id": "session_01Bare00000000", "events": []})
+        self.assertIn("1 skipped", r.stdout)
+        self.assertFalse((self.saved / "session_01Bare00000000.json").exists())
+
+    def test_f9_oversized_record_is_refused(self):
+        big = json.loads(export_line("session_01Huge00000000"))
+        big["events"][0]["payload"]["message"]["content"] = "x" * 50000
+        r = self.imp(big, export_line("session_01Small0000000"), extra_env={"CLAUDE_SESSION_ARCHIVE_MAX_RECORD_BYTES": "20000"})
+        self.assertIn("size limit", r.stdout)
+        self.assertFalse((self.saved / "session_01Huge00000000.json").exists())
+        self.assertTrue((self.saved / "session_01Small0000000.json").exists())
+
+    @unittest.skipUnless(POSIX, "symlinks")
+    def test_f10_symlinked_cloud_folder_refused(self):
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        (self.e.archive / "all-sessions" / "cloud").symlink_to(outside)
+        r = self.imp(export_line("session_01Escape000000"))
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_f11_uninstall_removes_every_cache(self):
+        self.imp(export_line("session_01Cache0000000"))
+        self.e.run("secrets")
+        self.assertTrue((self.e.conf / "saved-cache.json").exists())
+        self.e.run("uninstall")
+        for name in ("saved-cache.json", "secrets-cache.json", "index-cache.json"):
+            self.assertFalse((self.e.conf / name).exists(), name)
+
+    def test_cloud_url_with_query_is_listed_once(self):
+        self.imp(export_line("session_01Query0000000", kind="anthropic_cloud", title="Asked once"))
+        (self.e.archive / "data" / "cloud.json").write_text(json.dumps({"sessions": [
+            {"title": "Asked once", "url": "https://claude.ai/code/session_01Query0000000?tab=chat"}]}))
+        self.e.run("index")
+        self.assertEqual((self.e.archive / "INDEX.md").read_text(encoding="utf-8").count("Asked once"), 1)
+
+
+class SecretsReviewTests(Base):
+    def setUp(self):
+        super().setUp()
+        self.aws = "AKIA" + "Q7RT2MZP4KD9WX3N"
+        self.key_a = "-----BEGIN RSA PRIVATE KEY-----\n" + fake("MIIE", 120)
+        self.key_b = "-----BEGIN RSA PRIVATE KEY-----\n" + fake("MIIE", 120, alphabet="Zy9Xw8Vu7Ts6Rq5Po4Nm")
+        prompt = ("first line\n" + self.aws + "\tand DB_PASSWORD=Xk29mPq7Lw4n and\npassword: S3cretPass99\n"
+                  "password: process.env.DB_PASSWORD and token: string\n" + self.key_a + "\n" + self.key_b)
+        self.e.write_session("aaaa1111", transcript(prompt=prompt))
+        self.assertEqual(self.e.install().returncode, 0)
+        self.e.run("secrets")
+        self.report = (self.e.archive / "SECRETS.md").read_text(encoding="utf-8")
+
+    def test_f4_keys_after_json_escapes_and_env_assignments_found(self):
+        self.assertIn("| AWS access key id |", self.report)
+        self.assertEqual(self.report.count("| Password or secret assignment |"), 2, self.report)
+        self.assertNotIn("proc", self.report)
+
+    def test_google_key_in_a_url_query_is_found(self):
+        self.e.write_session("cccc3333", transcript(prompt="GET https://maps.example/v1/x?key=" + fake("AIza", 35) + "&q=1"))
+        self.e.run("sync")
+        self.assertIn("| Google API key |", (self.e.archive / "SECRETS.md").read_text(encoding="utf-8"))
+
+    def test_assignment_noise_is_not_reported(self):
+        self.e.write_session("dddd4444", transcript(prompt=(
+            "from_secret: gh_token2 and BETTER_AUTH_SECRET=replace-with-random-string and "
+            "STRIPE_SECRET_KEY= NEXT_VAR9=1 and SECRET='abcdefghijk'")))
+        self.e.run("sync")
+        self.assertEqual((self.e.archive / "SECRETS.md").read_text(encoding="utf-8").count("| Password or secret assignment |"), 2,
+                         "only the two real assignments from setUp")
+
+    def test_f5_each_private_key_has_its_own_fingerprint(self):
+        self.assertEqual(self.report.count("| Private key |"), 2)
+
+    def test_f7_fingerprints_are_keyed_and_short_values_barely_shown(self):
+        import hashlib
+        salt = (self.e.archive / "data" / ".secrets-salt").read_text().strip()
+        self.assertRegex(salt, r"^[0-9a-f]{64}$")
+        self.assertNotIn(hashlib.sha256(self.aws.encode()).hexdigest()[:12], self.report)
+        self.assertIn("`(12 chars)`", self.report)
+        self.assertNotIn("Xk", self.report, "a password shows its length only")
+
+    def test_f12_many_matches_on_one_line_stay_fast(self):
+        unit = "-eyJAAAAAAAAAA.eyJAAAAAAAAAA"  # the reviewer's input: thousands of JWT-shaped tokens
+        self.e.write_session("bbbb2222", transcript(prompt=unit * (3000000 // len(unit))))
+        t = time.time()
+        self.e.run("sync")  # the sync scans the new file (not from cache)
+        self.assertLess(time.time() - t, 5)
+
+
 class SecretsTests(Base):
     def setUp(self):
         super().setUp()
@@ -516,7 +683,7 @@ class SecretsTests(Base):
             "Anthropic API key": fake("sk-ant-api03-", 90),
             "AWS access key id": "AKIA" + "Q7RT2MZP4KD9WX3N",
             "GitHub token": fake("ghp_", 36),
-            "Database URL with password": "postgres://admin:" + fake("pw", 14) + "@db.internal:5432/app",
+            "Database URL with password": "postgres://test_runner:" + fake("pw", 14) + "@db.internal:5432/app",
         }
         pasted = " and ".join(self.keys.values())
         self.e.write_session("aaaa1111", transcript(prompt="use these: " + pasted + ' and password="' + fake("Pq", 12) + '"'))
@@ -562,6 +729,34 @@ class SecretsTests(Base):
         r = self.e.run("secrets", "--fail")
         self.assertEqual(r.returncode, 1)
         self.assertNotIn("| GitHub token |", report())
+
+    def test_sync_scans_and_index_reports_it(self):
+        r = self.e.run("sync")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue((self.e.archive / "SECRETS.md").exists(), "sync writes the report")
+        idx = (self.e.archive / "INDEX.md").read_text(encoding="utf-8")
+        self.assertIn("**Secrets:** 5 credential-shaped value(s)", idx)
+
+    def test_cache_holds_no_value_and_skips_unchanged_files(self):
+        self.e.run("secrets")
+        cache = (self.e.conf / "secrets-cache.json").read_text(encoding="utf-8")
+        for value in self.keys.values():
+            self.assertNotIn(value, cache)
+        data = json.loads(cache)
+        # poison the cache entry of one file: if it were re-read, the hit would come back
+        rel = next(k for k, v in data["files"].items() if v["hits"] and k.endswith("cccc3333.jsonl"))
+        data["files"][rel]["hits"] = []
+        (self.e.conf / "secrets-cache.json").write_text(json.dumps(data))
+        self.e.run("secrets")
+        gh = next(l for l in (self.e.archive / "SECRETS.md").read_text().splitlines() if "| GitHub token |" in l)
+        self.assertIn("| 1 |", gh, "an unchanged file is served from the cache, not re-read")
+        # a grown file is re-read
+        p = self.e.archive / "all-sessions" / "projects" / "-work-proj" / "cccc3333.jsonl"
+        with open(p, "a", encoding="utf-8") as fh:
+            fh.write(line(type="user", timestamp="2026-10-02T10:00:00Z", message={"role": "user", "content": "more"}))
+        self.e.run("secrets")
+        gh = next(l for l in (self.e.archive / "SECRETS.md").read_text().splitlines() if "| GitHub token |" in l)
+        self.assertIn("| 2 |", gh)
 
     def test_long_lines_stay_fast(self):
         self.e.write_session("eeee5555", transcript(prompt="eyJ" + "a" * 400000 + " sk-" + "-" * 300000 + " AKIA" + "Z" * 200000))

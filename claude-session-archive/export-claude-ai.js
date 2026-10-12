@@ -9,8 +9,12 @@
 //   1. Open https://claude.ai/code in your browser, signed in.
 //   2. Open the developer console (Chrome: View > Developer > JavaScript Console).
 //   3. Read this file, then paste it in and press Enter. Chrome may ask you to type "allow pasting" first.
-//   4. Save each file it downloads (claude-ai-sessions-<date>-partN.jsonl.gz). Then, in a terminal:
-//        claude-session-archive import ~/Downloads/claude-ai-sessions-*.jsonl.gz
+//   4. Save each file it downloads (claude-ai-sessions-<date>-partN.jsonl.gz). After the first one,
+//      Chrome asks whether claude.ai may download multiple files: click Allow, or the other parts
+//      are held back. The console says how many files to expect; check they are all there. Then:
+//        claude-session-archive import ~/Downloads/claude-ai-sessions-<date>-part1.jsonl.gz ...
+//      naming the files it saved (not a wildcard: anything else in Downloads with a similar name
+//      would be imported too).
 //
 // It only reads (GET requests to claude.ai) and only downloads to your own computer. Never paste code
 // into a console that you have not read; this file is short so that you can.
@@ -45,6 +49,7 @@
     a.href = URL.createObjectURL(gz);
     a.download = `claude-ai-sessions-${date}-part${part}.jsonl.gz`;
     document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 120000); // free the memory once saved
     console.log(`saved ${a.download}: ${lines.length} sessions, ${(gz.size / 1e6).toFixed(1)} MB`);
   };
 
@@ -64,5 +69,7 @@
     if ((n + 1) % 10 === 0) console.log(`${n + 1} / ${sessions.length}`);
   }
   if (lines.length) await save(lines);
-  console.log(`done: ${part} file(s)` + (failed.length ? `; failed: ${failed.join(", ")}` : ""));
+  console.log(`done: expect ${part} file(s) named claude-ai-sessions-${date}-part1 to part${part}.jsonl.gz in your downloads.`
+    + (part > 1 ? " If some are missing, Chrome blocked them: allow multiple downloads for claude.ai and run this again." : "")
+    + (failed.length ? ` Not exported: ${failed.join(", ")}` : ""));
 })();

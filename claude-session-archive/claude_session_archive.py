@@ -16,8 +16,11 @@ the archive is an ordinary folder, and any cloud backup comes from that folder b
 a drive your own sync client uploads.
 """
 import argparse
+import bisect
 import gzip
 import hashlib
+import hmac
+import secrets as random_bytes
 import json
 import os
 import re
@@ -30,8 +33,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "1.1.0"
-CACHE_VERSION = 3  # bump when scan_session() returns new fields, so cached rows are re-read
+VERSION = "1.2.0"
+CACHE_VERSION = 4  # bump when scan_session() returns new fields, so cached rows are re-read
 STALE_SECONDS = 20 * 3600
 LOCK_STALE_SECONDS = 2 * 3600
 RETENTION_DAYS = 36500
@@ -61,6 +64,7 @@ LOCK = CONF_DIR / "sync.lock"
 LOG = CONF_DIR / "sync.log"
 CACHE = CONF_DIR / "index-cache.json"
 SAVED_CACHE = CONF_DIR / "saved-cache.json"
+SECRETS_CACHE = CONF_DIR / "secrets-cache.json"
 INSTALLED = CONF_DIR / SCRIPT_NAME
 POSIX_SHIM = HOME / ".local" / "bin" / "claude-session-archive"
 WINDOWS_SHIM = CONF_DIR / "claude-session-archive.cmd"
@@ -203,6 +207,10 @@ def cmd_sync(args):
         if PROJECTS.is_dir():
             copied = copy_additive(PROJECTS, archive / "all-sessions", host)
             write_computer_manifest(PROJECTS, archive / "all-sessions", host)
+        try:  # a failed scan must never stop the archive from being kept
+            write_secrets_report(archive, *scan_secrets(archive))
+        except (Fail, OSError, ValueError) as exc:
+            log(f"secrets scan skipped: {exc}")
         count = build_index(archive)
         write_atomic(archive / "LAST-SYNC.txt", f"{datetime.now():%Y-%m-%d %H:%M} {host}\n")
         log(f"ok: {copied} file(s) copied, {count} sessions indexed")
@@ -245,11 +253,22 @@ and shows it at the end of INDEX.md.
 
 
 def clean(text, cap=None):
-    """One line, safe inside Markdown tables and headings: no newlines, no HTML comments or tags."""
-    text = " ".join(str(text or "").split()).replace("<", "&lt;").replace(">", "&gt;").replace("|", "\\|")
+    """One line, safe inside Markdown tables and headings: no newlines, no HTML tags, and no
+    Markdown links, images or auto-linked URLs, whatever the text came from. The only links in the
+    indexes are the ones link() builds, to claude.ai."""
+    text = " ".join(str(text or "").split()).replace("\\", "\\\\")
+    text = text.replace("<", "&lt;").replace(">", "&gt;").replace("|", "\\|").replace("[", "\\[").replace("]", "\\]").replace("`", "\\`")
+    # Renderers turn bare URLs into links; an entity looks the same but is never linked.
+    text = re.sub(r"(?i)(?<=[a-z])://", "&#58;//", text)
+    text = re.sub(r"(?i)\bwww\.", "www&#46;", text)
     if cap and len(text) > cap:
         text = text[: cap - 3].rstrip() + "..."
     return text
+
+
+def day(ts):
+    """YYYY-MM-DD from a timestamp, or "" if it does not start with one."""
+    return ts[:10] if isinstance(ts, str) and DATE.fullmatch(ts[:10]) else ""
 
 
 def first_prompt(msg):
@@ -299,8 +318,8 @@ def scan_session(path, src):
         "custom_title": title,
         "title": title or ai_title or "(untitled)",
         "cwd": cwd or "",
-        "start": first_ts[:10],
-        "last": (last_ts or first_ts)[:10],
+        "start": day(first_ts),
+        "last": day(last_ts or first_ts) or day(first_ts),
         "prompt": (prompt or "")[:160],
         "file": path.relative_to(src).as_posix(),
         "entrypoint": entry or "",
@@ -406,7 +425,15 @@ def event_text(event):
 
 
 def scan_saved_file(path):
-    """A row for a session saved from claude.ai, read from its own record."""
+    """A row for a saved claude.ai session, or None (logged) if the record cannot be read."""
+    try:
+        return read_saved_file(path)
+    except (OSError, ValueError, TypeError, AttributeError, KeyError, IndexError, RecursionError) as exc:
+        log(f"skip {path.name}: unreadable saved session ({type(exc).__name__})")
+        return None
+
+
+def read_saved_file(path):
     try:
         rec = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
@@ -424,7 +451,8 @@ def scan_saved_file(path):
 
     config = meta.get("config") if isinstance(meta.get("config"), dict) else {}
     repo = branch = ""
-    for o in config.get("outcomes") or []:
+    outcomes = config.get("outcomes")
+    for o in outcomes if isinstance(outcomes, list) else []:
         g = o.get("git_info") if isinstance(o, dict) else None
         if isinstance(g, dict) and isinstance(g.get("repo"), str):
             repo = g["repo"]
@@ -440,14 +468,14 @@ def scan_saved_file(path):
                 break
     prompt = ""
     for e in rec["events"]:
-        t = event_text(e)
+        t = event_text(e) if isinstance(e, dict) else None
         if t and t[0] == "user":
             prompt = " ".join(t[1].split())[:160]
             break
     origin = config.get("origin") if isinstance(config.get("origin"), str) else ""
     return {
         "id": path.stem, "kind": field("environment_kind"), "title": field("title") or "(untitled)",
-        "start": field("created_at")[:10], "last": field("last_event_at")[:10],
+        "start": day(field("created_at")), "last": day(field("last_event_at")),
         "started_from": ORIGINS.get(origin, origin), "repo": repo, "branch": branch, "prompt": prompt,
         "saved": path.name,
     }
@@ -501,7 +529,7 @@ def load_cloud(data_dir, saved):
                 ("repo", "branch", "started_from", "first_request", "group", "date", "last")}
         start = text["date"] if DATE.fullmatch(text["date"]) else ""
         last = text["last"] if DATE.fullmatch(text["last"]) and text["last"] >= start else start
-        m = re.search(r"/(session_[A-Za-z0-9]{8,64})$", url)
+        m = re.search(r"/(session_[A-Za-z0-9]{8,64})(?:[?#][^\\s]{0,200})?$", url)
         sid = m.group(1) if m else ""
         copy = saved.get(sid, {})
         rows.append({
@@ -524,12 +552,13 @@ def saved_row(r):
         "title": r["title"], "custom_title": None, "start": r["start"], "last": r["last"] or r["start"],
         "cwd": r["repo"], "branch": r["branch"], "started_from": r["started_from"], "prompt": r["prompt"],
         "file": "", "saved": r["saved"], "group_hint": "", "summary": {}, "entrypoint": "", "bridge": "",
+        "kind": r["kind"],
     }
 
 
 def link(label, url):
-    label = clean(label).replace("[", "\\[").replace("]", "\\]")
-    return f"[{label}]({url})" if url else label
+    label = clean(label)
+    return f"[{label}]({url})" if url and CLOUD_URL.fullmatch(url) else label
 
 
 def session_url(row):
@@ -543,7 +572,8 @@ def where(row, computers):
         repo = row["cwd"] + (f" ({row['branch']})" if row["cwd"] and row["branch"] else "")
         return clean(" · ".join(p for p in ("Cloud", row["started_from"], repo) if p))
     if row.get("recovered"):
-        how = f"{row['started_from'] or 'unknown app'}, Remote Control"
+        how = row["started_from"] or "unknown app"
+        how += ", Remote Control" if row.get("kind") == "bridge" else (f", {row['kind']}" if row.get("kind") else "")
         return clean(" · ".join(p for p in ("Recovered from claude.ai", how, row["cwd"]) if p))
     surface = SURFACES.get(row.get("entrypoint", ""), row.get("entrypoint", "")) or "unknown app"
     hosts = computers.get(row["file"]) or ["computer not recorded"]
@@ -670,6 +700,11 @@ def build_index(archive):
         "| Your notes on curated projects (shown at the end of this file) | `data/curated.md` |",
         "| Raw transcripts and project memory, from every computer | `all-sessions/` |", "",
         "A linked session title opens it on claude.ai: a cloud session, or one that had Remote Control on.", "",
+    ]
+    n_secrets = secrets_summary(archive)
+    if n_secrets:
+        idx += [f"**Secrets:** {n_secrets} credential-shaped value(s) are stored in this archive; see [`SECRETS.md`](SECRETS.md) (values masked).", ""]
+    idx += [
         f"## All sessions ({len(rows)}: {counts})", "",
     ]
     if kinds:
@@ -754,7 +789,9 @@ def cmd_digest(args):
     # Sessions saved from claude.ai (see `import`), unless a local transcript already covers them.
     local = {"session_" + r["bridge"][4:] for r in (scan_all(src) if src.is_dir() else []) if r.get("bridge")}
     for row in scan_saved(archive / "all-sessions" / "cloud"):
-        sid = row["id"]
+        sid = row.get("id")
+        if not (isinstance(sid, str) and SESSION_ID.fullmatch(sid) and row.get("saved") == f"{sid}.json"):
+            continue  # a cache row that does not describe a saved copy
         if sid in have or sid in local:
             continue
         try:
@@ -781,7 +818,8 @@ def cmd_digest(args):
 # Credential formats with a recognisable shape. Every quantifier is bounded, because these run
 # over transcript lines that can be megabytes long. Order matters: the first match at a position wins.
 SECRET_PATTERNS = [
-    ("Private key", re.compile(r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY-----")),
+    ("Private key", re.compile(r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY-----"
+                               r"(?:\s|\\[nr]){0,6}(?P<value>[A-Za-z0-9+/=]{40,200})?")),
     ("Anthropic API key", re.compile(r"(?<![A-Za-z0-9_-])sk-ant-[A-Za-z0-9_-]{20,200}")),
     ("OpenAI API key", re.compile(r"(?<![A-Za-z0-9_-])sk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{32,200}")),
     ("AWS access key id", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
@@ -790,15 +828,19 @@ SECRET_PATTERNS = [
     ("Slack token", re.compile(r"\bxox[abposr]-[A-Za-z0-9-]{10,200}")),
     ("Slack webhook", re.compile(r"hooks\.slack\.com/services/[A-Za-z0-9/]{20,120}")),
     ("Stripe live key", re.compile(r"\b[rs]k_live_[A-Za-z0-9]{16,200}")),
-    ("Google API key", re.compile(r"(?<![A-Za-z0-9+/=_-])AIza[0-9A-Za-z_-]{35}(?![A-Za-z0-9_-])")),
+    ("Google API key", re.compile(r"(?<![A-Za-z0-9+/_-])AIza[0-9A-Za-z_-]{35}(?![A-Za-z0-9_-])")),
     ("npm token", re.compile(r"\bnpm_[A-Za-z0-9]{36}")),
     ("Database URL with password", re.compile(
-        r"\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp)://[^:@/\s\"'\\]{1,100}:[^@/\s\"'\\]{3,200}@")),
-    ("JSON Web Token (usually short-lived)", re.compile(r"\beyJ[A-Za-z0-9_-]{10,2000}\.eyJ[A-Za-z0-9_-]{10,4000}\.[A-Za-z0-9_-]{10,2000}")),
+        r"\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp)://[^:@/\s\"'\\]{1,100}:(?P<value>[^@/\s\"'\\]{3,200})@")),
+    ("JSON Web Token (usually short-lived)", re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{10,2000}\.eyJ[A-Za-z0-9_-]{10,4000}\.[A-Za-z0-9_-]{10,2000}")),
+    ("Password or secret assignment", re.compile(
+        r"(?i)(?<![A-Za-z0-9_])(?!from_secret)(?:[A-Za-z0-9]{1,20}_){0,4}(?:password|passwd|secret|secret_key|secret_access_key|api_key|"
+        r"access_token|auth_token|private_key|client_secret)(?:=|\s{0,3}:\s{1,3})(?P<value>[^\s\"'`\\<>,;(){}\[\]]{8,200})")),
     ("Password or secret assignment", re.compile(
         r"(?i)\b(?:password|passwd|pwd|secret|api_?key|access_?token|auth_?token|client_secret)\\?[\"']?\s{0,3}[:=]\s{0,3}\\?[\"']"
         r"(?P<value>[^\"'\s\\<>]{8,200})\\?[\"']")),
 ]
+UNQUOTED_ASSIGNMENT = next(rx for k, rx in SECRET_PATTERNS if k == "Password or secret assignment")
 # Values that are obviously not real: placeholders, examples, variable references, masks.
 PLACEHOLDER = re.compile(r"(?i)(?:x{6}|\*{4}|\.{3}|example|placeholder|changeme|your[_-]|<|\$\{|\$[A-Z_]|redacted|dummy|sample|test|correct-horse)")
 # A literal every match of a pattern contains, so a pattern only runs on lines that could match.
@@ -810,21 +852,48 @@ SECRET_ANCHORS = {
     "Google API key": ("AIza",), "npm token": ("npm_",), "Database URL with password": ("://",),
     "JSON Web Token (usually short-lived)": ("eyJ",),
 }
-SECRET_WORDS = ("password", "passwd", "pwd", "secret", "api_key", "apikey", "access_token", "accesstoken",
+SECRET_WORDS = ("password", "passwd", "pwd", "secret", "api_key", "apikey", "access_token", "accesstoken", "private_key",
                 "auth_token", "authtoken", "client_secret")
 # Kinds whose shape alone is weak evidence: the value must also look random (digits and mixed case).
 NEEDS_RANDOM = ("OpenAI API key",)
+# An unquoted value that is a plain word or a dotted name is code (password: string, process.env.X).
+IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z_]{0,199}|[A-Za-z_][A-Za-z0-9_]{0,99}(?:\.[A-Za-z_][A-Za-z0-9_]{0,99}){1,10}")
 SECRET_SUFFIXES = (".jsonl", ".json", ".md", ".txt")
 
 
-def mask(value):
-    if len(value) <= 12:
+PASSWORD_KINDS = ("Password or secret assignment", "Database URL with password")
+
+
+def mask(value, kind=""):
+    """Enough to recognise a value you know, not enough to recover one you don't. Passwords show
+    only their length; keys, which start with a public format prefix, show a little more."""
+    if kind in PASSWORD_KINDS:
+        return f"({len(value)} chars)"
+    if len(value) < 20:
         return f"{value[:2]}… ({len(value)} chars)"
+    if len(value) < 40:
+        return f"{value[:4]}… ({len(value)} chars)"
     return f"{value[:4]}…{value[-2:]} ({len(value)} chars)"
 
 
-def fingerprint(value):
-    return hashlib.sha256(value.encode("utf-8", "replace")).hexdigest()[:12]
+def secrets_salt(archive):
+    """A random key kept in the archive (data/.secrets-salt), so fingerprints in SECRETS.md cannot
+    be used to test guesses by someone who has only that file."""
+    path = archive / "data" / ".secrets-salt"
+    try:
+        salt = path.read_text(encoding="utf-8").strip()
+        if re.fullmatch(r"[0-9a-f]{64}", salt):
+            return salt
+    except OSError:
+        pass
+    salt = random_bytes.token_hex(32)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_atomic(path, salt + "\n")
+    return salt
+
+
+def fingerprint(value, salt=""):
+    return hmac.new(salt.encode(), value.encode("utf-8", "replace"), hashlib.sha256).hexdigest()[:12]
 
 
 def looks_random(value):
@@ -833,6 +902,9 @@ def looks_random(value):
 
 def find_secrets(line):
     """(kind, value) for each credential in a line; a span already claimed is not matched twice."""
+    # In transcripts a key often follows a JSON escape such as \\n; the letter would defeat the
+    # word-boundary checks below, so escapes are turned into spaces first.
+    line = line.replace("\\n", " ").replace("\\t", " ").replace("\\r", " ")
     taken = []
     lower = None
     for kind, rx in SECRET_PATTERNS:
@@ -846,47 +918,93 @@ def find_secrets(line):
                 continue
         for m in rx.finditer(line):
             value = m.group("value") if "value" in rx.groupindex else m.group(0)
-            start, end = m.span()
-            if any(a < end and start < b for a, b in taken):
+            if value is None:  # a private key header with no key after it: a mention, not a key
                 continue
-            taken.append((start, end))
+            start, end = m.span()
+            # taken holds non-overlapping spans sorted by start: check only the neighbours
+            i = bisect.bisect_left(taken, (start, end))
+            if (i > 0 and taken[i - 1][1] > start) or (i < len(taken) and taken[i][0] < end):
+                continue
+            taken.insert(i, (start, end))
             if kind != "Private key" and PLACEHOLDER.search(value):
                 continue
             if kind in NEEDS_RANDOM and not looks_random(value):
                 continue
+            if rx is UNQUOTED_ASSIGNMENT and IDENTIFIER.fullmatch(value):
+                continue
+            if kind == "Password or secret assignment" and not any(c.isdigit() for c in value):
+                continue  # words and phrases (change-me, replace-with-random) are placeholders
             yield kind, value
 
 
-def cmd_secrets(args):
-    """Scan every file in the archive for credentials and write SECRETS.md, which shows each one
-    masked, with a fingerprint and where it occurs. Nothing is changed in the transcripts."""
-    archive = archive_dir()
+def patterns_version():
+    """Changes whenever a pattern does, so cached scan results never outlive the rules that made them."""
+    text = "|".join(f"{k}={rx.pattern}" for k, rx in SECRET_PATTERNS) + PLACEHOLDER.pattern + repr(NEEDS_RANDOM)
+    return hashlib.sha256(text.encode()).hexdigest()[:16]
+
+
+def scan_secrets(archive):
+    """{fingerprint: {kind, masked, places}} for every credential under all-sessions/, re-reading only
+    files whose size or mtime changed. The cache holds fingerprints, masked forms and line numbers:
+    never a value."""
     root = archive / "all-sessions"
-    ignore = read_data(archive / "data" / "secrets-ignore.json", "secrets to ignore").get("ignore", [])
-    ignore = {i for i in ignore if isinstance(i, str)}
-    found = {}  # fingerprint -> {kind, masked, places}
-    files = 0
+    salt = secrets_salt(archive)
+    version = patterns_version() + hashlib.sha256(salt.encode()).hexdigest()[:8]
+    try:
+        cache = json.loads(SECRETS_CACHE.read_text(encoding="utf-8"))
+        if not isinstance(cache, dict) or cache.get("v") != version or cache.get("root") != str(root):
+            cache = {}
+    except (OSError, ValueError):
+        cache = {}
+    old = cache.get("files", {}) if isinstance(cache.get("files"), dict) else {}
+    new, files = {}, 0
     for path in sorted(root.rglob("*")) if root.is_dir() else []:
         if path.is_symlink() or not path.is_file() or path.suffix not in SECRET_SUFFIXES:
             continue
         files += 1
         rel = path.relative_to(archive).as_posix()
         try:
+            st = path.stat()
+        except OSError:
+            continue
+        sig = [st.st_size, int(st.st_mtime)]
+        hit = old.get(rel)
+        if isinstance(hit, dict) and hit.get("sig") == sig and isinstance(hit.get("hits"), list):
+            new[rel] = hit
+            continue
+        hits = []
+        try:
             with open(path, encoding="utf-8", errors="replace") as fh:
                 for n, line in enumerate(fh, 1):
                     for kind, value in set(find_secrets(line)):  # a line often repeats a value
-                        fp = fingerprint(value)
-                        if fp in ignore:
-                            continue
-                        hit = found.setdefault(fp, {"kind": kind, "masked": mask(value), "places": []})
-                        if len(hit["places"]) < 1000:
-                            hit["places"].append(f"{rel}:{n}")
+                        hits.append([fingerprint(value, salt), kind, mask(value, kind), n])
         except OSError as exc:
             log(f"skip {path}: {exc}")
+            continue
+        new[rel] = {"sig": sig, "hits": hits}
+    try:
+        CONF_DIR.mkdir(parents=True, exist_ok=True)
+        write_atomic(SECRETS_CACHE, json.dumps({"v": version, "root": str(root), "files": new}))
+    except OSError:
+        pass
+    ignore = read_data(archive / "data" / "secrets-ignore.json", "secrets to ignore").get("ignore", [])
+    ignore = {i for i in ignore if isinstance(i, str)}
+    found = {}
+    for rel in sorted(new):
+        for fp, kind, masked, n in new[rel]["hits"]:
+            if fp in ignore:
+                continue
+            h = found.setdefault(fp, {"kind": kind, "masked": masked, "places": []})
+            if len(h["places"]) < 1000:
+                h["places"].append(f"{rel}:{n}")
+    return files, found
+
+
+def write_secrets_report(archive, files, found):
     order = sorted(found.items(), key=lambda kv: (kv[1]["kind"] == "Password or secret assignment", kv[1]["kind"], -len(kv[1]["places"])))
     out = [
         "# Secrets found in the archive", "",
-        f"Scanned {files} files under `all-sessions/` on {datetime.now():%Y-%m-%d %H:%M}. Do not edit: rebuilt by `claude-session-archive secrets`.", "",
+        f"Scanned {files} files under `all-sessions/` on {datetime.now():%Y-%m-%d %H:%M}. Do not edit: rebuilt on every sync and by `claude-session-archive secrets`.", "",
         "Values are masked and never written here. A real credential below has been stored in plain text in every copy of this archive "
         "(and in `~/.claude` on the computer it came from): **rotate it** with the service that issued it. "
         "To silence one that is not a secret (a test value), add its fingerprint to `data/secrets-ignore.json` as `{\"ignore\": [\"<fingerprint>\"]}`.", "",
@@ -898,6 +1016,24 @@ def cmd_secrets(args):
             out.append(f"| {clean(h['kind'])} | `{clean(h['masked'])}` | `{fp}` | {len(h['places'])} | `{clean(h['places'][0])}` |")
         out.append("")
     write_atomic(archive / "SECRETS.md", "\n".join(out) + "\n")
+
+
+def secrets_summary(archive):
+    """The finding count from the last SECRETS.md, or None if there is none."""
+    try:
+        m = re.search(r"\*\*(\d{1,7}) distinct value", (archive / "SECRETS.md").read_text(encoding="utf-8"))
+    except OSError:
+        return None
+    return int(m.group(1)) if m else None
+
+
+def cmd_secrets(args):
+    """Scan every file in the archive for credentials and write SECRETS.md, which shows each one
+    masked, with a fingerprint and where it occurs. Nothing is changed in the transcripts."""
+    archive = archive_dir()
+    files, found = scan_secrets(archive)
+    write_secrets_report(archive, files, found)
+    build_index(archive)
     kinds = {}
     for h in found.values():
         kinds[h["kind"]] = kinds.get(h["kind"], 0) + 1
@@ -909,66 +1045,173 @@ def cmd_secrets(args):
 # ---------------------------------------------------------------- import
 
 
+# One exported session; the largest seen in practice is about 10 MB. Overridable for tests.
+MAX_RECORD_BYTES = int(os.environ.get("CLAUDE_SESSION_ARCHIVE_MAX_RECORD_BYTES") or 256 * 1024 * 1024)
+
+
+def read_lines(fh):
+    """Lines of a text stream, refusing any longer than MAX_RECORD_BYTES (yields None for those)
+    so a hostile or corrupt file cannot exhaust memory."""
+    while True:
+        line = fh.readline(MAX_RECORD_BYTES + 1)
+        if not line:
+            return
+        if len(line) > MAX_RECORD_BYTES and not line.endswith("\n"):
+            while True:  # discard the rest of the over-long line
+                rest = fh.readline(1 << 20)
+                if not rest or rest.endswith("\n"):
+                    break
+            yield None
+            continue
+        yield line
+
+
 def export_records(path):
     """Session records from a claude.ai export: JSON Lines, one session per line, or one JSON
-    object holding {"sessions": [...]}; either may be gzip-compressed."""
+    object holding {"sessions": [...]} (on one line or indented); either may be gzip-compressed.
+    Yields records, or (None, reason) for a line that could not be used."""
     with open(path, "rb") as fh:
         gz = fh.read(2) == b"\x1f\x8b"
     opener = gzip.open if gz else open
-    with opener(path, "rt", encoding="utf-8") as fh:
-        for n, line in enumerate(fh, 1):
+    with opener(path, "rt", encoding="utf-8-sig") as fh:
+        first = True
+        for line in read_lines(fh):
+            if line is None:
+                yield None, "record larger than the size limit"
+                continue
             if not line.strip():
                 continue
             try:
                 obj = json.loads(line)
-            except ValueError as exc:
-                raise Fail(f"{path}: line {n} is not JSON ({exc})")
+            except (ValueError, RecursionError):
+                if first and line.lstrip().startswith("{"):  # an indented single JSON document
+                    yield from whole_document(path, opener)
+                    return
+                yield None, "line is not JSON"
+                continue
+            first = False
             items = obj.get("sessions") if isinstance(obj, dict) and isinstance(obj.get("sessions"), list) else [obj]
             for item in items:
                 yield item
 
 
+def whole_document(path, opener):
+    with opener(path, "rt", encoding="utf-8-sig") as fh:
+        text = fh.read(MAX_RECORD_BYTES + 1)
+    if len(text) > MAX_RECORD_BYTES:
+        yield None, "file larger than the size limit"
+        return
+    try:
+        obj = json.loads(text)
+    except (ValueError, RecursionError):
+        yield None, "not JSON"
+        return
+    items = obj.get("sessions") if isinstance(obj, dict) and isinstance(obj.get("sessions"), list) else [obj]
+    for item in items:
+        yield item
+
+
+def event_keys(events):
+    """Identities of a session's events, to tell a grown copy from a different one."""
+    keys = set()
+    for e in events:
+        if isinstance(e, dict):
+            k = e.get("event_id") or e.get("uuid") or e.get("sequence_num")
+            keys.add(str(k) if k is not None else json.dumps(e, sort_keys=True)[:200])
+    return keys
+
+
+def file_record(dest, rec):
+    """Write one session record. Returns new / updated / unchanged / kept-beside / skipped.
+    A saved copy is only replaced by one that contains every event it has; any other different
+    copy is kept beside it under versions/, never over it."""
+    sid = rec.get("id") if isinstance(rec, dict) else None
+    if isinstance(sid, str) and sid.startswith("cse_"):
+        sid = "session_" + sid[4:]
+    if not (isinstance(sid, str) and SESSION_ID.fullmatch(sid) and isinstance(rec.get("events"), list)):
+        return "skipped"
+    if not (isinstance(rec.get("metadata"), dict) or isinstance(rec.get("listing"), dict)):
+        return "skipped"  # not what export-claude-ai.js writes
+    keep = {k: rec[k] for k in ("exported_at", "listing", "metadata") if k in rec}
+    body = json.dumps({"id": sid, **keep, "events": rec["events"]}, ensure_ascii=False)
+    out = dest / f"{sid}.json"
+    if out.is_symlink() or (out.exists() and not out.is_file()):
+        log(f"skip {out}: not a regular file")
+        return "skipped"
+    if not out.exists():
+        write_atomic(out, body)
+        return "new"
+    try:
+        have = json.loads(out.read_text(encoding="utf-8")).get("events")
+        have = have if isinstance(have, list) else None
+    except (OSError, ValueError, AttributeError, RecursionError):
+        have = None
+    new_keys = event_keys(rec["events"])
+    if have is not None:
+        old_keys = event_keys(have)
+        if new_keys <= old_keys:
+            return "unchanged"
+        if old_keys <= new_keys:
+            write_atomic(out, body)
+            return "updated"
+    # Different content, or an existing copy that cannot be read: keep both.
+    side = dest / "versions" / f"{sid}.{hashlib.sha256(body.encode('utf-8')).hexdigest()[:12]}.json"
+    if side.is_symlink() or side.exists():
+        return "unchanged"
+    side.parent.mkdir(parents=True, exist_ok=True)
+    write_atomic(side, body)
+    return "kept beside"
+
+
 def cmd_import(args):
     """File sessions exported from claude.ai into all-sessions/cloud/, one file per session.
-    A copy already in the archive is only replaced by one holding more events."""
+    Never replaces a saved copy with one that has lost events; never stops on a bad file."""
     archive = archive_dir()
     if not archive.is_dir():
         raise Fail(f"archive not reachable: {archive}")
+    for d in (archive / "all-sessions", archive / "all-sessions" / "cloud"):
+        if d.is_symlink():
+            raise Fail(f"{d} is a symlink; refusing to write through it")
     dest = archive / "all-sessions" / "cloud"
     dest.mkdir(parents=True, exist_ok=True)
-    added = grown = kept = bad = 0
-    for name in args.files:
-        path = Path(name).expanduser()
-        if not path.is_file():
-            raise Fail(f"no such file: {path}")
-        for rec in export_records(path):
-            sid = rec.get("id") if isinstance(rec, dict) else None
-            if isinstance(sid, str) and sid.startswith("cse_"):
-                sid = "session_" + sid[4:]
-            if not (isinstance(sid, str) and SESSION_ID.fullmatch(sid) and isinstance(rec.get("events"), list)):
-                bad += 1
+    if not acquire_lock():
+        raise Fail("a sync is running; try again in a minute")
+    counts, problems, added = {}, [], []
+    try:
+        for name in args.files:
+            path = Path(name).expanduser()
+            if not path.is_file():
+                problems.append(f"{path}: not a file")
                 continue
-            out = dest / f"{sid}.json"
-            if out.is_symlink():
-                log(f"skip {out}: is a symlink in the archive")
-                bad += 1
-                continue
-            if out.exists():
-                try:
-                    have = len(json.loads(out.read_text(encoding="utf-8")).get("events") or [])
-                except (OSError, ValueError, AttributeError):
-                    have = -1
-                if have >= len(rec["events"]):
-                    kept += 1
-                    continue
-                grown += 1
-            else:
-                added += 1
-            keep = {k: rec[k] for k in ("exported_at", "listing", "metadata") if k in rec}
-            write_atomic(out, json.dumps({"id": sid, **keep, "events": rec["events"]}, ensure_ascii=False))
-    print(f"{added} new, {grown} updated, {kept} unchanged, {bad} skipped (not a session)")
+            try:
+                for rec in export_records(path):
+                    if isinstance(rec, tuple):
+                        problems.append(f"{path.name}: {rec[1]}")
+                        continue
+                    result = file_record(dest, rec)
+                    counts[result] = counts.get(result, 0) + 1
+                    if result == "new":
+                        meta = rec.get("metadata") if isinstance(rec.get("metadata"), dict) else {}
+                        listing = rec.get("listing") if isinstance(rec.get("listing"), dict) else {}
+                        title = meta.get("title") or listing.get("title") or "(untitled)"
+                        added.append(re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", str(title))[:100])
+            except (OSError, EOFError, UnicodeDecodeError, ValueError, gzip.BadGzipFile if hasattr(gzip, "BadGzipFile") else OSError) as exc:
+                problems.append(f"{path.name}: unreadable ({type(exc).__name__}); sessions before the error were kept")
+    finally:
+        try:
+            LOCK.unlink()
+        except OSError:
+            pass
+    print(", ".join(f"{counts.get(k, 0)} {k}" for k in ("new", "updated", "unchanged", "kept beside", "skipped")))
+    for t in added[:50]:
+        print(f"  + {t}")
+    if len(added) > 50:
+        print(f"  + ... and {len(added) - 50} more")
+    for p in problems:
+        print(f"problem: {p}")
     print(f"{build_index(archive)} sessions indexed")
-    return 0
+    print("The export files hold whole conversations: delete them now that they are filed.")
+    return 1 if problems else 0
 
 
 # ---------------------------------------------------------------- settings.json
@@ -1152,7 +1395,7 @@ def cmd_uninstall(args):
         print(f"could not edit settings ({exc}); remove the claude-session-archive SessionStart hook by hand")
     if POSIX_SHIM.exists() and SCRIPT_NAME in POSIX_SHIM.read_text(encoding="utf-8", errors="replace"):
         POSIX_SHIM.unlink()
-    for p in (INSTALLED, CONF, STAMP, LOCK, CACHE, WINDOWS_SHIM):
+    for p in (INSTALLED, CONF, STAMP, LOCK, CACHE, SAVED_CACHE, SECRETS_CACHE, WINDOWS_SHIM):
         try:
             p.unlink()
         except OSError:
