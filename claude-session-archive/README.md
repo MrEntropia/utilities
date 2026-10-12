@@ -167,7 +167,7 @@ What else the archive reveals, beyond the conversations themselves:
 - **Keeping transcripts forever is itself a trade-off.** With `cleanupPeriodDays` at 36500, a secret pasted into a session also stays in `~/.claude` on your computer indefinitely, not only in the archive.
 - Digests (`digest`) contain your messages (up to 1500 characters each), including anything you pasted. Handing them to a new Claude session to summarise sends that text to the model provider again and records it in the new session's transcript, which is archived too.
 - An export from claude.ai (`export-claude-ai.js`) is the same kind of content as a transcript, in a file in your Downloads folder. Once `import` has filed it, delete the export.
-- `SECRETS.md` never contains a credential, only its first four and last two characters, its length, a fingerprint (the first 12 hex digits of its SHA-256) and the files it is in. That is still enough to tell someone where to look, so it is as private as the rest of the archive.
+- `SECRETS.md`, and the scan cache `secrets-cache.json` in the tool's config folder, never contain a credential: only its kind, a masked form (a password shows only its length), a keyed fingerprint and the files it is in. That is still enough to tell someone where to look, so keep them as private as the rest of the archive.
 - The settings backups the installer writes (`~/.claude/settings.json.bak-<timestamp>`, the newest 3 kept, readable by you only) contain whatever your settings contain, including any `env` tokens.
 
 The archive, indexes, config and log are created readable by you only (permissions 0600 / 0700 on macOS and Linux). An independent review of the code, its findings, and the tests that pin each fix are described in [securityaudit.md](securityaudit.md); run them with `python3 -m unittest discover -s tests`.
@@ -181,14 +181,16 @@ claude.ai keeps its own copy of two kinds of session:
 
 According to [Anthropic's data usage page](https://code.claude.com/docs/en/data-usage), what claude.ai keeps follows your account's retention policy, so don't rely on it lasting. There is no documented export, so this folder includes [`export-claude-ai.js`](export-claude-ai.js), a short script you run yourself in your browser while signed in to claude.ai. It reads the same addresses the claude.ai page loads, with your own sign-in, and downloads every session as compressed files. The tool itself still makes no network requests.
 
-1. Open https://claude.ai/code, open the developer console (Chrome: View > Developer > JavaScript Console), read `export-claude-ai.js`, paste it in and press Enter. Save each file it downloads.
-2. File them into the archive:
+1. Open https://claude.ai/code, open the developer console (Chrome: View > Developer > JavaScript Console), read `export-claude-ai.js`, paste it in and press Enter. Only paste the file from this repository: a modified copy would run with your claude.ai sign-in. Save each file it downloads; after the first, Chrome asks whether claude.ai may download multiple files, and the rest are held back until you click **Allow**. The console says how many files to expect.
+2. File them into the archive, naming the files the script saved:
 
    ```sh
-   claude-session-archive import ~/Downloads/claude-ai-sessions-*.jsonl.gz
+   claude-session-archive import ~/Downloads/claude-ai-sessions-2026-10-11-part1.jsonl.gz ~/Downloads/claude-ai-sessions-2026-10-11-part2.jsonl.gz
    ```
 
-   Each session becomes `all-sessions/cloud/session_<id>.json`. An existing copy is only replaced by one with more events, so importing an older export never loses anything.
+   Name them rather than using a wildcard such as `claude-ai-sessions-*`: anything else in Downloads with a matching name, including a file a website saved there, would be imported too. `import` lists the title of every session it adds, so check that list.
+
+   Each session becomes `all-sessions/cloud/session_<id>.json`. A saved copy is only replaced by one that contains every event it already has; a copy with different content is kept beside it under `all-sessions/cloud/versions/`, so importing never loses anything. A record that does not look like an export, a file it cannot read, or a session larger than 256 MB is reported and skipped, never a reason to stop.
 3. Delete the downloaded files.
 
 The index then shows:
@@ -216,13 +218,19 @@ Only `title` is required. Only `https://claude.ai/` links are accepted.
 ## Scanning for secrets
 
 ```sh
-claude-session-archive secrets          # writes SECRETS.md in the archive
+claude-session-archive secrets          # scan now and write SECRETS.md in the archive
 claude-session-archive secrets --fail   # also exits 1 if anything is found
 ```
 
+**Every sync also runs it**, so `SECRETS.md` stays current without you doing anything, and `INDEX.md` opens with a line saying how many credential-shaped values the archive holds. The first scan reads everything (minutes on a large archive, in the background); after that only new and grown files are read, using a cache in the tool's own config folder (`secrets-cache.json`) that holds fingerprints, masked forms and line numbers, never a value. The cache resets itself whenever the patterns change. A failed scan never stops a sync.
+
 It reads every transcript, memory note and saved claude.ai copy in the archive and looks for credentials with a recognisable shape: private keys; Anthropic, OpenAI, Google, Stripe (live), npm, GitLab and GitHub tokens; AWS access key ids; Slack tokens and webhooks; database URLs with a password; JSON Web Tokens; and `password = "..."`-style assignments. Obvious placeholders (`your-api-key`, `xxxxxx`, `${VAR}`, `example`, `test`) are skipped.
 
-`SECRETS.md` lists each distinct value once, **masked** (first four and last two characters, and its length), with a fingerprint, how many places it appears and where it was first seen. It never contains the value itself, and the tool never changes a transcript.
+`SECRETS.md` lists each distinct value once, **masked**, with a fingerprint, how many places it appears and where it was first seen. Passwords (assignments and the password in a database URL) show only their length; keys show the first few characters of their public format prefix and, if long, the last two. It never contains the value itself, and the tool never changes a transcript.
+
+The fingerprint is an HMAC keyed with a random value kept in `data/.secrets-salt`, so it identifies a value across scans and computers without letting someone who has only `SECRETS.md` test guesses against it. Keep the salt with the archive; deleting it changes every fingerprint, so the entries in `data/secrets-ignore.json` stop matching.
+
+What it does not scan: your own `data/` files and `digest` output. `digest` copies the text of your messages, credentials included, so run `secrets` before handing digests to a model.
 
 For each real credential, **rotate it** with the service that issued it: it is stored in plain text in every copy of the archive and in `~/.claude` on the computer it came from, so deleting it from one file does not make it secret again. For a match that isn't a secret (a test value), add its fingerprint to `data/secrets-ignore.json`:
 
