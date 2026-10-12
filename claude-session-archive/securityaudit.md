@@ -226,6 +226,19 @@ Run by the author on copies of real transcripts, never the originals, in a sandb
 
 Not covered: whether Claude Code can resume a redacted transcript (that would send it to the model); the timestamp comparison in this run was invalid, because the reference copy was made with `cp -R`, which does not keep timestamps, so timestamp preservation rests on its unit test; Windows.
 
+## 1.5.0: shared settings and reminders (author's review)
+
+Small and read-only, so reviewed by the author rather than independently; the checks that matter for it:
+
+| Property | How it holds | Test |
+|---|---|---|
+| A reminder can never stop or slow a Claude Code session | `remind` only reads two small files, has a 10-second timeout in the hook, catches every exception and always exits 0 | `test_remind_never_fails`, `test_remind_survives_an_unwritable_config_folder` (the catch-all shown necessary by mutation) |
+| A hostile or broken `settings.json` changes nothing it should not | each value is type- and range-checked against a fixed list; anything else falls back to its default; unknown keys are ignored; the tool never writes the file after creating it once | `test_reminders_off_and_bad_settings_fall_back_safely`, `test_settings_are_never_overwritten` |
+| The reminder does not nag | at most once a day, silent when nothing is due, and switchable off | `test_at_most_once_a_day`, `test_reminds_when_never_or_overdue_and_not_when_recent` |
+| Still no network access | settings and reminders read local files only; `test_no_network_or_subprocess_imports` still passes | |
+
+Every behaviour above was reverted alone and turned its test red. Checked with Claude Code 2.1.296: a synchronous SessionStart hook's JSON output, including `systemMessage`, is received and recorded as successful (`hook_response` event). That the message appears in the interactive interface rests on Claude Code's documentation, to be confirmed by the first real reminder.
+
 ## Confirmed properties (checked, unchanged)
 
 - **No network access and no other programs run by the tool.** It imports only standard-library modules for files, JSON, paths and time; no `subprocess`, `urllib`, `http`, sockets beyond reading the computer's own name. Pinned by `test_no_network_or_subprocess_imports`. The installers use the network only to install Python when it is missing (Homebrew, the Linux package manager, or `winget`).

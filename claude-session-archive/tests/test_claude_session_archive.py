@@ -17,6 +17,7 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parent.parent / "claude_session_archive.py"
@@ -1007,6 +1008,112 @@ class RedactReviewTests(Base):
         self.assertEqual(m.session_of("all-sessions/projects/-p/abc/subagents/x.jsonl"), "abc")
         self.assertEqual(m.session_of("all-sessions/projects/-p/memory/MEMORY.md"), "")
         self.assertEqual(m.session_of("all-sessions/cloud/versions/session_01abcdefgh.1234.json"), "session_01abcdefgh")
+
+
+class SettingsAndReminderTests(Base):
+    def setUp(self):
+        super().setUp()
+        self.e.write_session("aaaa1111", transcript())
+        self.assertEqual(self.e.install().returncode, 0)
+        self.settings = self.e.archive / "data" / "settings.json"
+
+    def remind(self):
+        (self.e.conf / "last-reminder").unlink() if (self.e.conf / "last-reminder").exists() else None
+        r = self.e.run("remind")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout)["systemMessage"] if r.stdout.strip() else ""
+
+    def imported(self, days_ago):
+        when = datetime.now() - timedelta(days=days_ago)
+        (self.e.archive / "data" / "claude-ai-import.json").write_text(json.dumps({"last": when.isoformat(timespec="seconds"), "computer": "pc"}))
+
+    def test_install_writes_default_settings_and_both_hooks(self):
+        data = json.loads(self.settings.read_text())
+        self.assertEqual(data["remind_claude_ai_import_every_days"], 14)
+        hooks = [h for e in self.e.settings()["hooks"]["SessionStart"] for h in e["hooks"]]
+        self.assertEqual([h["args"][1:] for h in hooks], [["sync", "--if-stale"], ["remind"]])
+        self.assertTrue(hooks[0]["async"])
+        self.assertNotIn("async", hooks[1], "the reminder must run synchronously to be shown")
+        self.e.run("uninstall")
+        self.assertEqual(self.e.settings()["hooks"]["SessionStart"], [])
+
+    def test_settings_are_never_overwritten(self):
+        self.settings.write_text(json.dumps({"remind_claude_ai_import_every_days": 30}))
+        self.e.install()
+        self.assertEqual(json.loads(self.settings.read_text()), {"remind_claude_ai_import_every_days": 30})
+
+    def test_reminds_when_never_or_overdue_and_not_when_recent(self):
+        self.assertIn("never been saved", self.remind())
+        self.imported(20)
+        self.assertIn("20 days ago", self.remind())
+        self.imported(2)
+        self.assertEqual(self.remind(), "")
+        self.settings.write_text(json.dumps({"remind_claude_ai_import_every_days": 1}))
+        self.assertIn("2 days ago", self.remind(), "the shared setting is honoured")
+
+    def test_at_most_once_a_day(self):
+        self.assertTrue(self.e.run("remind").stdout.strip())
+        self.assertEqual(self.e.run("remind").stdout.strip(), "")
+
+    def test_reminders_off_and_bad_settings_fall_back_safely(self):
+        self.settings.write_text(json.dumps({"reminders": False}))
+        self.assertEqual(self.remind(), "")
+        self.settings.write_text("{not json")
+        self.assertEqual(self.remind(), "", "an unreadable file (drive mid-sync) means the last good settings")
+        (self.e.conf / "settings-cache.json").unlink()
+        self.assertIn("never been saved", self.remind(), "and with none seen yet, the defaults")
+        self.settings.write_text(json.dumps({"remind_claude_ai_import_every_days": -5, "reminders": "yes"}))
+        self.assertIn("reminder every 14 days", self.remind())
+
+    def test_reminds_when_this_computer_stopped_syncing(self):
+        self.imported(1)
+        old = time.time() - 5 * 86400
+        os.utime(self.e.conf / "last-ok", (old, old))
+        self.assertIn("last synced 5 days ago", self.remind())
+
+    def test_remind_never_fails(self):
+        (self.e.conf / "config.json").write_text("{broken")
+        r = self.e.run("remind")
+        self.assertEqual(r.returncode, 0)
+        self.assertNotIn("Traceback", r.stderr)
+
+    @unittest.skipUnless(POSIX and os.geteuid() != 0, "POSIX permissions")
+    def test_remind_survives_an_unwritable_config_folder(self):
+        os.chmod(self.e.conf, 0o500)  # recording "reminded today" will fail
+        try:
+            r = self.e.run("remind")
+        finally:
+            os.chmod(self.e.conf, 0o700)
+        self.assertEqual(r.returncode, 0)
+        self.assertNotIn("Traceback", r.stderr)
+
+    def test_import_records_the_check_in_and_index_shows_it(self):
+        idx = (self.e.archive / "INDEX.md").read_text(encoding="utf-8")
+        self.assertIn("**claude.ai sessions:** never saved", idx)
+        f = Path(self.e.tmp.name) / "e.jsonl"
+        f.write_text(export_line("session_01Checkin00000"))
+        self.e.run("import", str(f))
+        self.assertIn("last", json.loads((self.e.archive / "data" / "claude-ai-import.json").read_text()))
+        self.assertEqual(self.remind(), "")
+        idx = (self.e.archive / "INDEX.md").read_text(encoding="utf-8")
+        self.assertIn("**claude.ai sessions:** last saved", idx)
+        self.imported(40)
+        self.e.run("index")
+        self.assertIn("⚠️ overdue", (self.e.archive / "INDEX.md").read_text(encoding="utf-8"))
+
+    def test_sync_interval_and_secrets_switch_from_settings(self):
+        self.settings.write_text(json.dumps({"scan_secrets_on_sync": False}))
+        if (self.e.archive / "SECRETS.md").exists():
+            (self.e.archive / "SECRETS.md").unlink()
+        self.e.run("sync")
+        self.assertFalse((self.e.archive / "SECRETS.md").exists())
+        self.settings.write_text(json.dumps({"sync_every_hours": 1}))
+        self.e.run("sync")  # remembers the setting locally
+        old = time.time() - 2 * 3600
+        os.utime(self.e.conf / "last-sync", (old, old))
+        before = (self.e.conf / "last-sync").stat().st_mtime
+        self.e.run("sync", "--if-stale")
+        self.assertGreater((self.e.conf / "last-sync").stat().st_mtime, before, "2 h > 1 h setting: it synced")
 
 
 class SourceTests(unittest.TestCase):

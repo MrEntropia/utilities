@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.5.0 (2026-10-12)
+
+- Shared settings in the archive, `data/settings.json`, created on install and read by every computer: `sync_every_hours`, `scan_secrets_on_sync`, `reminders`, `remind_claude_ai_import_every_days`, `remind_if_sync_older_than_days`. Values are type- and range-checked; an unreadable file means the last good settings.
+- Reminders: a second SessionStart hook (`remind`, synchronous, at most once a day, never fails) shows a one-line reminder in Claude Code when your claude.ai sessions are due to be saved again or this computer's sync has stopped. `import` records each check-in in `data/claude-ai-import.json`; `INDEX.md` shows when they were last saved and flags it when overdue. `status` shows the settings in effect and the last import.
+
 ## 1.4.0 (2026-10-12)
 
 Fixes from the third independent review (R1 to R10, see `securityaudit.md`), all on `redact` and the `SECRETS.md` triage:

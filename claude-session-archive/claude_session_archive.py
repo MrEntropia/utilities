@@ -10,6 +10,7 @@ Commands:
   secrets                   scan the archive for credentials; report them masked in SECRETS.md
   redact FINGERPRINT...     replace chosen credentials with a <descriptor> (dry run unless --apply)
   status                    show what is configured, and whether the hook can run
+  remind                    (run by the hook) say when claude.ai sessions are due to be saved
   uninstall                 remove the hook and the installed copy (the archive is left alone)
 
 Standard library only, Python 3.8+. Makes no network requests and runs no other programs:
@@ -34,9 +35,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 CACHE_VERSION = 4  # bump when scan_session() returns new fields, so cached rows are re-read
-STALE_SECONDS = 20 * 3600
 LOCK_STALE_SECONDS = 2 * 3600
 RETENTION_DAYS = 36500
 KEEP_BACKUPS = 3
@@ -66,6 +66,9 @@ LOG = CONF_DIR / "sync.log"
 CACHE = CONF_DIR / "index-cache.json"
 SAVED_CACHE = CONF_DIR / "saved-cache.json"
 SECRETS_CACHE = CONF_DIR / "secrets-cache.json"
+SETTINGS_CACHE = CONF_DIR / "settings-cache.json"  # last shared settings seen, for when the drive is offline
+LAST_OK = CONF_DIR / "last-ok"            # touched when a sync completes
+LAST_REMINDER = CONF_DIR / "last-reminder"
 INSTALLED = CONF_DIR / SCRIPT_NAME
 POSIX_SHIM = HOME / ".local" / "bin" / "claude-session-archive"
 WINDOWS_SHIM = CONF_DIR / "claude-session-archive.cmd"
@@ -118,6 +121,73 @@ def archive_dir():
     if not isinstance(archive, str) or not archive:
         raise Fail(f"not installed ({CONF} missing). Run: install --archive <folder>")
     return Path(archive)
+
+
+# ---------------------------------------------------------------- shared settings
+
+# data/settings.json in the archive: one file every computer reads. Each entry: default, minimum, maximum.
+SHARED_SETTINGS = {
+    "sync_every_hours": (20, 1, 720),
+    "scan_secrets_on_sync": (True, None, None),
+    "reminders": (True, None, None),
+    "remind_claude_ai_import_every_days": (14, 1, 365),
+    "remind_if_sync_older_than_days": (3, 1, 365),
+}
+SETTINGS_ABOUT = ("Shared by every computer that syncs this archive. sync_every_hours: how often a session start "
+                  "syncs. scan_secrets_on_sync: run the secrets scan in each sync. reminders: show reminders when a "
+                  "Claude Code session starts. remind_claude_ai_import_every_days: remind you to save your claude.ai "
+                  "sessions (export-claude-ai.js, then import) this often. remind_if_sync_older_than_days: remind you "
+                  "if this computer has not synced for this long.")
+
+
+def shared_settings(archive=None):
+    """The shared settings, each checked against its type and range; anything missing, wrong or
+    unreadable falls back to its default. Read from the archive when given and reachable (and
+    remembered locally), otherwise from the last copy seen."""
+    raw = None
+    if archive is not None:
+        try:
+            raw = json.loads((archive / "data" / "settings.json").read_text(encoding="utf-8-sig"))
+            write_atomic(SETTINGS_CACHE, json.dumps(raw))
+        except (OSError, ValueError):
+            raw = None
+    if raw is None:
+        try:
+            raw = json.loads(SETTINGS_CACHE.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            raw = {}
+    out = {}
+    for key, (default, lo, hi) in SHARED_SETTINGS.items():
+        v = raw.get(key, default) if isinstance(raw, dict) else default
+        if isinstance(default, bool):
+            out[key] = v if isinstance(v, bool) else default
+        elif isinstance(v, (int, float)) and not isinstance(v, bool) and lo <= v <= hi:
+            out[key] = v
+        else:
+            out[key] = default
+    return out
+
+
+def ensure_shared_settings(archive):
+    """Create data/settings.json with the defaults if it does not exist yet (never overwrites)."""
+    path = archive / "data" / "settings.json"
+    if not path.exists():
+        body = {"about": SETTINGS_ABOUT, **{k: v[0] for k, v in SHARED_SETTINGS.items()}}
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_atomic(path, json.dumps(body, indent=2) + "\n")
+
+
+def days_since(ts):
+    return (time.time() - ts) / 86400
+
+
+def last_import(archive):
+    """(epoch seconds, computer) of the last claude.ai import into this archive, or None."""
+    try:
+        rec = json.loads((archive / "data" / "claude-ai-import.json").read_text(encoding="utf-8"))
+        return datetime.fromisoformat(rec["last"]).timestamp(), str(rec.get("computer", ""))
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
 
 
 # ---------------------------------------------------------------- sync
@@ -195,7 +265,8 @@ def acquire_lock():
 
 def cmd_sync(args):
     archive = archive_dir()
-    if args.if_stale and STAMP.exists() and time.time() - STAMP.stat().st_mtime < STALE_SECONDS:
+    every = shared_settings()["sync_every_hours"] * 3600  # last copy seen: no drive access needed to decide
+    if args.if_stale and STAMP.exists() and time.time() - STAMP.stat().st_mtime < every:
         return 0
     if not archive.is_dir():
         log(f"archive not reachable (cloud drive not mounted?): {archive}")
@@ -214,13 +285,16 @@ def cmd_sync(args):
             enforce_redactions(archive, written)
         except (Fail, OSError, ValueError) as exc:
             log(f"redactions not re-applied: {exc}")
+        settings = shared_settings(archive)
         try:  # a failed scan must never stop the archive from being kept
-            write_secrets_report(archive, *scan_secrets(archive))
+            if settings["scan_secrets_on_sync"]:
+                write_secrets_report(archive, *scan_secrets(archive))
         except (Fail, OSError, ValueError) as exc:
             log(f"secrets scan skipped: {exc}")
         count = build_index(archive)
         write_atomic(archive / "LAST-SYNC.txt", f"{datetime.now():%Y-%m-%d %H:%M} {host}\n")
         log(f"ok: {copied} file(s) copied, {count} sessions indexed")
+        LAST_OK.touch()
         return 0
     finally:
         try:
@@ -708,6 +782,15 @@ def build_index(archive):
         "| Raw transcripts and project memory, from every computer | `all-sessions/` |", "",
         "A linked session title opens it on claude.ai: a cloud session, or one that had Remote Control on.", "",
     ]
+    imp = last_import(archive)
+    every = shared_settings(archive)["remind_claude_ai_import_every_days"]
+    if imp is None:
+        idx += ["**claude.ai sessions:** never saved into this archive. See the README, \"Sessions on claude.ai\".", ""]
+    else:
+        age = days_since(imp[0])
+        when = f"{datetime.fromtimestamp(imp[0]):%Y-%m-%d} ({int(age)} day(s) ago, from {clean(imp[1]) or 'unknown computer'})"
+        flag = f" **⚠️ overdue**: the setting is every {every} day(s); export and import again." if age > every else ""
+        idx += [f"**claude.ai sessions:** last saved {when}.{flag}", ""]
     n_secrets = secrets_summary(archive)
     if n_secrets and n_secrets[0]:
         flag = f"**⚠️ {n_secrets[1]} need attention**" if n_secrets[1] else "none needs attention"
@@ -1568,6 +1651,10 @@ def cmd_import(args):
             enforce_redactions(archive, WRITTEN)
         except (Fail, OSError, ValueError) as exc:
             problems.append(f"redactions not re-applied: {exc}")
+        if counts:  # something was read from an export: this counts as saving your claude.ai sessions
+            write_atomic(archive / "data" / "claude-ai-import.json", json.dumps({
+                "last": datetime.now().isoformat(timespec="seconds"), "computer": socket.gethostname(),
+                "sessions": sum(counts.values()), "new": counts.get("new", 0)}, indent=2) + "\n")
     finally:
         try:
             LOCK.unlink()
@@ -1636,7 +1723,7 @@ def is_ours(entry):
             continue
         cmd = h.get("command") if isinstance(h.get("command"), str) else ""
         args = [a for a in h.get("args", []) if isinstance(a, str)] if isinstance(h.get("args"), list) else []
-        if any(a.endswith(SCRIPT_NAME) for a in args) and "sync" in args:
+        if any(a.endswith(SCRIPT_NAME) for a in args) and ("sync" in args or "remind" in args):
             return True
         if "claude-session-archive" in cmd and "sync" not in args:
             return True  # shell-form hook from a pre-release version
@@ -1646,8 +1733,12 @@ def is_ours(entry):
 def hook_entry(python):
     # Exec form (command + args): no shell, so no quoting or injection issues and the same
     # entry works on macOS, Linux and Windows. async: never delays the start of a session.
+    # The reminder runs synchronously (so Claude Code can show what it prints) but only reads two
+    # small files, with a short timeout.
     return {"hooks": [{"type": "command", "command": python,
-                       "args": [str(INSTALLED), "sync", "--if-stale"], "async": True}]}
+                       "args": [str(INSTALLED), "sync", "--if-stale"], "async": True},
+                      {"type": "command", "command": python,
+                       "args": [str(INSTALLED), "remind"], "timeout": 10}]}
 
 
 def retention(settings):
@@ -1727,6 +1818,7 @@ def cmd_install(args):
 
     archive.mkdir(exist_ok=True)
     (archive / "data").mkdir(exist_ok=True)
+    ensure_shared_settings(archive)
     CONF_DIR.mkdir(parents=True, exist_ok=True)
     me = Path(__file__).resolve()
     if me != INSTALLED.resolve():
@@ -1766,13 +1858,53 @@ def cmd_uninstall(args):
         print(f"could not edit settings ({exc}); remove the claude-session-archive SessionStart hook by hand")
     if POSIX_SHIM.exists() and SCRIPT_NAME in POSIX_SHIM.read_text(encoding="utf-8", errors="replace"):
         POSIX_SHIM.unlink()
-    for p in (INSTALLED, CONF, STAMP, LOCK, CACHE, SAVED_CACHE, SECRETS_CACHE, WINDOWS_SHIM):
+    for p in (INSTALLED, CONF, STAMP, LOCK, CACHE, SAVED_CACHE, SECRETS_CACHE, SETTINGS_CACHE, LAST_OK, LAST_REMINDER, WINDOWS_SHIM):
         try:
             p.unlink()
         except OSError:
             pass
     print("removed the installed copy. Left alone: the archive folder, cleanupPeriodDays in settings.json, "
           f"the PATH entry, settings backups and the log ({LOG}).")
+    return 0
+
+
+def reminder_text(archive):
+    """The reminder to show, or "" when nothing is due."""
+    settings = shared_settings(archive)
+    if not settings["reminders"]:
+        return ""
+    notes = []
+    imp = last_import(archive) if archive is not None else None
+    every = settings["remind_claude_ai_import_every_days"]
+    if archive is not None and (imp is None or days_since(imp[0]) > every):
+        age = "have never been saved" if imp is None else f"were last saved {int(days_since(imp[0]))} days ago"
+        notes.append(f"Your claude.ai sessions {age} (reminder every {every} days). On claude.ai/code, run "
+                     "export-claude-ai.js in the browser console, then: claude-session-archive import <the saved files>.")
+    stale = settings["remind_if_sync_older_than_days"]
+    if LAST_OK.exists() and days_since(LAST_OK.stat().st_mtime) > stale:
+        notes.append(f"This computer's session archive last synced {int(days_since(LAST_OK.stat().st_mtime))} days ago; "
+                     "run: claude-session-archive status")
+    return " ".join(notes)
+
+
+def cmd_remind(args):
+    """Run by a SessionStart hook: prints a reminder for Claude Code to show, at most once a day.
+    Never fails and never slows a session: anything unexpected means no reminder."""
+    try:
+        if LAST_REMINDER.exists() and days_since(LAST_REMINDER.stat().st_mtime) < 1:
+            return 0
+        archive = load_config().get("archive")
+        archive = Path(archive) if isinstance(archive, str) and archive and Path(archive).is_dir() else None
+        text = reminder_text(archive)
+        if text:
+            print(json.dumps({"systemMessage": "claude-session-archive: " + text}))
+            CONF_DIR.mkdir(parents=True, exist_ok=True)
+            LAST_REMINDER.touch()
+    except Exception as exc:  # a reminder is never worth breaking a session start for
+        try:
+            log(f"remind skipped: {type(exc).__name__}")
+        except Exception:
+            pass
     return 0
 
 
@@ -1794,6 +1926,13 @@ def cmd_status(args):
     print(f"retention       {str(days) + ' days' if days else '30 days (default): transcripts are deleted after 30 days'}")
     print(f"last sync here  {datetime.fromtimestamp(STAMP.stat().st_mtime):%Y-%m-%d %H:%M}" if STAMP.exists() else "last sync here  never")
     print(f"local sessions  {len(list(PROJECTS.glob('*/*.jsonl'))) if PROJECTS.is_dir() else 0}")
+    archive = Path(conf["archive"]) if isinstance(conf.get("archive"), str) and Path(conf["archive"]).is_dir() else None
+    if archive is not None:
+        imp = last_import(archive)
+        print(f"claude.ai saved {datetime.fromtimestamp(imp[0]):%Y-%m-%d} from {imp[1]}" if imp else "claude.ai saved never")
+        print(f"settings        {archive / 'data' / 'settings.json'}")
+        for k, v in shared_settings(archive).items():
+            print(f"  {k} = {json.dumps(v)}")
     print(f"log             {LOG}")
     return 0
 
@@ -1828,6 +1967,7 @@ def main(argv=None):
     sc.add_argument("--fail", action="store_true", help="exit 1 if anything is found")
     sc.set_defaults(fn=cmd_secrets)
     sub.add_parser("status", help="show configuration").set_defaults(fn=cmd_status)
+    sub.add_parser("remind", help="(run by the hook) print a reminder when something is due").set_defaults(fn=cmd_remind)
     sub.add_parser("uninstall", help="remove the hook and installed copy").set_defaults(fn=cmd_uninstall)
     args = p.parse_args(argv)
     try:

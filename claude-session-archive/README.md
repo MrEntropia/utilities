@@ -23,6 +23,8 @@ This tool:
 | Sessions on claude.ai | Brings in cloud sessions and Remote Control sessions whose local transcript was already deleted, from an export you make in your browser | `export-claude-ai.js`, `import` | 1.1 |
 | Secrets scan | Finds passwords, API keys, private keys, tokens and database URLs in everything the archive holds, on every sync, and lists them in `SECRETS.md` with values masked | automatic, `secrets` | 1.1, in every sync since 1.2 |
 | Secrets triage | `SECRETS.md` puts what needs attention first and folds away what is probably not live (with the reason); your verdicts in `data/secrets-triage.json` override it | automatic | 1.3 |
+| Shared settings | One `data/settings.json` in the archive that every computer reads: sync interval, secrets scan on or off, reminders | edit the file | 1.5 |
+| Reminders | When a Claude Code session starts and your claude.ai sessions are due to be saved again, or this computer's sync has stopped, a one-line reminder with the steps; `INDEX.md` shows when they were last saved | automatic | 1.5 |
 | Redact | Replaces a credential you choose with a `<secret removed: ...>` descriptor in the archive and in this computer's transcripts, and keeps it out on every later sync and import; dry run unless `--apply` | `redact` | 1.3, safeguards 1.4 |
 
 Every feature has been through an independent security review; what each review found, how it was fixed and how it was tested is in [securityaudit.md](securityaudit.md).
@@ -41,6 +43,8 @@ Claude Session Archive/
     cloud.json        optional details for cloud sessions (claude.ai/code)
     secrets-ignore.json   fingerprints that `secrets` should stop reporting
     secrets-triage.json   your verdict on findings (real, dev, test, example, rotated, not-secret)
+    settings.json     shared settings, read by every computer (created on install)
+    claude-ai-import.json  when your claude.ai sessions were last imported, and from which computer
     curated.md        your notes on projects worth keeping; shown at the end of INDEX.md
   all-sessions/
     projects/...      copies of every transcript and Claude Code project memory
@@ -109,6 +113,39 @@ claude-session-archive import FILE...  # file sessions exported from claude.ai, 
 claude-session-archive secrets         # scan for credentials, see "Scanning for secrets"
 claude-session-archive redact FP...    # replace chosen credentials with a <descriptor> (dry run unless --apply)
 ```
+
+### Settings
+
+`data/settings.json` in the archive is created on install with the defaults and read by every computer that syncs the archive, so you change a setting once:
+
+```json
+{
+  "sync_every_hours": 20,
+  "scan_secrets_on_sync": true,
+  "reminders": true,
+  "remind_claude_ai_import_every_days": 14,
+  "remind_if_sync_older_than_days": 3
+}
+```
+
+| Setting | Meaning | Allowed |
+|---|---|---|
+| `sync_every_hours` | at most one sync per this many hours, started by a Claude Code session | 1 to 720 |
+| `scan_secrets_on_sync` | run the secrets scan as part of each sync | true / false |
+| `reminders` | show reminders when a Claude Code session starts | true / false |
+| `remind_claude_ai_import_every_days` | remind you to save your claude.ai sessions this often | 1 to 365 |
+| `remind_if_sync_older_than_days` | remind you if this computer has not synced for this long | 1 to 365 |
+
+A value that is missing, of the wrong type or out of range falls back to its default; an unreadable file (for example while your drive is still syncing it) means the last good settings this computer saw. `claude-session-archive status` prints the settings in effect.
+
+### Reminders
+
+Your claude.ai sessions only reach the archive when you export and import them, so the tool reminds you:
+
+- **In Claude Code.** A second, very small hook runs when a session starts. If your last import is older than `remind_claude_ai_import_every_days`, or never happened, or this computer's last successful sync is older than `remind_if_sync_older_than_days`, Claude Code shows one line with the steps, for example *"claude-session-archive: Your claude.ai sessions were last saved 16 days ago (reminder every 14 days). On claude.ai/code, run export-claude-ai.js in the browser console, then: claude-session-archive import <the saved files>."* At most once a day. It only reads two small files, never fails a session start, and is silent when nothing is due.
+- **In `INDEX.md`.** It opens with *"claude.ai sessions: last saved 2026-10-12 (3 day(s) ago, from my-laptop)"*, with **⚠️ overdue** added when the reminder interval has passed.
+
+An import counts as saving your claude.ai sessions whenever it reads at least one session from the files you give it.
 
 ### Groups
 
