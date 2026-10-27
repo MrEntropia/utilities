@@ -37,7 +37,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 CACHE_VERSION = 4  # bump when scan_session() returns new fields, so cached rows are re-read
 LOCK_STALE_SECONDS = 2 * 3600
 RETENTION_DAYS = 36500
@@ -1943,14 +1943,41 @@ def find_secret_spans(line):
             yield kind, value, vstart, vstart + len(value), context
 
 
+# Where a one-line JSON document may be cut: between two objects in an array. A quote inside a JSON
+# string is always escaped, so `}, {"` (or `},{"`) never occurs inside a value and no credential
+# is ever cut in two.
+JSON_CUT = re.compile(r'\}, ?(?=\{")')
+JSON_CUT_MIN = 1 << 16  # smaller files gain nothing from being cut
+
+
+def json_pieces(text):
+    """A .json file as pieces that concatenate back to it exactly. A saved claude.ai session is one
+    line, often tens of MB: scanned whole, every pattern's anchor occurs somewhere in it, so every
+    pattern runs over all of it. Cut between array elements, most pieces are skipped by the anchor
+    check, as the lines of a transcript are. A file with line breaks (settings, notes) stays whole,
+    so a key written over several lines is found whole."""
+    if "\n" in text or len(text) < JSON_CUT_MIN:
+        return [text]
+    pieces, last = [], 0
+    for m in JSON_CUT.finditer(text):
+        pieces.append(text[last:m.end()])
+        last = m.end()
+    pieces.append(text[last:])
+    return pieces
+
+
 def secret_units(path):
     """(text, first line number) pieces of a file to scan: each line of a .jsonl transcript (one
-    record per line), or the whole of any other file, so a key written over several lines in a
-    note is found whole. Read without newline translation, so offsets match the bytes on disk."""
+    record per line), a one-line .json document cut between array elements (see json_pieces), or
+    the whole of any other file, so a key written over several lines in a note is found whole.
+    Read without newline translation, so offsets match the bytes on disk."""
     with open(path, encoding="utf-8", errors="strict", newline="") as fh:
         if path.suffix == ".jsonl":
             for n, line in enumerate(fh, 1):
                 yield line, n
+        elif path.suffix == ".json":
+            for piece in json_pieces(fh.read()):
+                yield piece, 1  # json_pieces cuts only files without line breaks
         else:
             yield fh.read(), 1
 
@@ -1976,7 +2003,15 @@ def scan_secrets(archive):
     except (OSError, ValueError):
         cache = {}
     old = cache.get("files", {}) if isinstance(cache.get("files"), dict) else {}
-    new, files = {}, 0
+
+    def save(entries):
+        try:
+            CONF_DIR.mkdir(parents=True, exist_ok=True)
+            write_atomic(SECRETS_CACHE, json.dumps({"v": version, "root": str(root), "files": entries}))
+        except OSError:
+            pass
+
+    new, files, todo = {}, 0, []
     setup = archive / "setup"
     candidates = (sorted(root.rglob("*")) if root.is_dir() else []) + \
                  (sorted(setup.rglob("*")) if setup.is_dir() and not setup.is_symlink() else [])
@@ -1995,10 +2030,26 @@ def scan_secrets(archive):
         if isinstance(hit, dict) and hit.get("sig") == sig and isinstance(hit.get("hits"), list):
             new[rel] = hit
             continue
+        todo.append((path, rel, sig, st.st_size))
+    # Only new and changed files are read. The cache is saved as the scan goes, so an interrupted
+    # scan (a closed laptop, a killed hook) resumes where it stopped instead of starting over.
+    total = sum(size for *_x, size in todo)
+    show = sys.stderr.isatty()
+    done, saved_at, started = 0, time.monotonic(), time.monotonic()
+    for i, (path, rel, sig, size) in enumerate(todo, 1):
+        if show:
+            print(f"\rscanning for secrets: file {i}/{len(todo)}, {done / 1e6:.0f}/{total / 1e6:.0f} MB ",
+                  end="", file=sys.stderr, flush=True)
+        if time.monotonic() - saved_at > 60:
+            save({**old, **new})
+            saved_at = time.monotonic()
+        done += size
         hits = []
         try:
+            seen = set()
             for unit, n in secret_units(path):
-                seen = set()  # a line often repeats a value
+                if path.suffix != ".json":
+                    seen = set()  # a line often repeats a value; a .json file counts it once, as when read whole
                 for kind, value, start, _e, ctx in find_secret_spans(unit):
                     fp = finding_fp(kind, value, salt)
                     if fp not in seen:
@@ -2013,11 +2064,11 @@ def scan_secrets(archive):
             log(f"skip {path}: {type(exc).__name__}")
             continue
         new[rel] = {"sig": sig, "hits": hits}
-    try:
-        CONF_DIR.mkdir(parents=True, exist_ok=True)
-        write_atomic(SECRETS_CACHE, json.dumps({"v": version, "root": str(root), "files": new}))
-    except OSError:
-        pass
+    if show and todo:
+        print(file=sys.stderr)
+    if todo:
+        log(f"secrets: scanned {len(todo)} new or changed file(s), {total / 1e6:.0f} MB, in {time.monotonic() - started:.0f}s")
+    save(new)
     ignore = read_data(archive / "data" / "secrets-ignore.json", "secrets to ignore").get("ignore", [])
     ignore = {i for i in ignore if isinstance(i, str)}
     found = {}
@@ -2187,7 +2238,9 @@ def redact_text(path, text, targets, salt, values):
     Raises Fail if a JSON line would stop parsing. Collects the replaced values in `values` (memory
     only) so the caller can look for other copies of the same text."""
     counts = {}
-    units = text.split("\n") if path.suffix == ".jsonl" else [text]
+    # The same pieces the scan reads, so both agree on what a finding is (see json_pieces).
+    units = text.split("\n") if path.suffix == ".jsonl" else json_pieces(text) if path.suffix == ".json" else [text]
+    cut = path.suffix == ".json" and len(units) > 1
     for i, unit in enumerate(units):
         spans = [(st, en, finding_fp(k, v, salt), k, ctx, v) for k, v, st, en, ctx in find_secret_spans(unit)]
         spans = [x for x in spans if x[2] in targets]
@@ -2198,7 +2251,7 @@ def redact_text(path, text, targets, salt, values):
             new = new[:st] + descriptor(kind, ctx["where"], fp) + new[en:]
             counts[fp] = counts.get(fp, 0) + 1
             values.setdefault(fp, set()).add(value.strip())
-        if path.suffix in (".jsonl", ".json"):
+        if path.suffix in (".jsonl", ".json") and not cut:  # a cut document is checked whole, below
             pieces = [(unit, new)] if path.suffix == ".jsonl" else list(zip(unit.split("\n"), new.split("\n")))
             for old_l, new_l in pieces:
                 try:
@@ -2210,7 +2263,19 @@ def redact_text(path, text, targets, salt, values):
                 except (ValueError, RecursionError):
                     raise Fail(f"{path}: line {i + 1} would not stay valid JSON; file left unchanged")
         units[i] = new
-    return "\n".join(units), counts
+    if not cut:
+        return "\n".join(units), counts
+    out = "".join(units)
+    if counts:
+        try:
+            json.loads(text)
+        except (ValueError, RecursionError):
+            return out, counts  # not valid JSON before either: nothing to keep valid
+        try:
+            json.loads(out)
+        except (ValueError, RecursionError):
+            raise Fail(f"{path}: would not stay valid JSON; file left unchanged")
+    return out, counts
 
 
 def read_exact(path):
@@ -2534,6 +2599,13 @@ def cmd_import(args):
             write_atomic(archive / "data" / "claude-ai-import.json", json.dumps({
                 "last": datetime.now().isoformat(timespec="seconds"), "computer": computer_name(),
                 "sessions": sum(counts.values()), "new": counts.get("new", 0)}, indent=2) + "\n")
+        if (counts.get("new") or counts.get("updated") or counts.get("kept beside")) and shared_settings(archive)["scan_secrets_on_sync"]:
+            # Scan what was just filed now, while you are watching, rather than in the next sync's
+            # hook; only these files are read, the rest come from the cache.
+            try:
+                write_secrets_report(archive, *scan_secrets(archive))
+            except (Fail, OSError, ValueError) as exc:
+                problems.append(f"secrets scan not run: {exc}")
     finally:
         try:
             LOCK.unlink()

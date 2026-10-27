@@ -528,6 +528,99 @@ class ImportTests(Base):
                       (self.e.archive / "SESSIONS.md").read_text(encoding="utf-8"))
 
 
+def big_export_line(sid, secret, events=1500):
+    """A saved claude.ai session large enough to be cut into pieces, with `secret` in two events."""
+    rec = json.loads(export_line(sid))
+    rec["events"] = [{"sequence_num": str(i), "event_type": "user",
+                      "payload": {"message": {"role": "user",
+                                              "content": f"step {i}: " + ("use " + secret if i in (5, events - 5) else "carry on")}}}
+                     for i in range(events)]
+    return json.dumps(rec) + "\n"
+
+
+class BigCopyScanTests(Base):
+    """A saved claude.ai session is one JSON line of tens of MB: the scan cuts it between array
+    elements so the anchor check skips most of it, and import scans what it filed."""
+
+    def setUp(self):
+        super().setUp()
+        self.e.write_session("aaaa1111", transcript())
+        self.assertEqual(self.e.install().returncode, 0)
+        self.token = fake("ghp_", 36)
+        self.export = Path(self.e.tmp.name) / "big.jsonl"
+        self.export.write_text(big_export_line("session_01BigCopy000000", self.token))
+        self.copy = self.e.archive / "all-sessions" / "cloud" / "session_01BigCopy000000.json"
+
+    def module(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("csa", SCRIPT)
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        return m
+
+    def test_json_pieces_rejoin_exactly_and_never_cut_inside_a_value(self):
+        m = self.module()
+        inner = 'holds }, {"x": 1} and },{"y"'  # dumped into JSON, its quotes are escaped
+        text = json.dumps({"events": [{"t": inner}] * 3000})
+        pieces = m.json_pieces(text)
+        self.assertGreater(len(pieces), 1000, "a large one-line document is cut")
+        self.assertEqual("".join(pieces), text)
+        quoted = json.dumps(inner)
+        self.assertEqual(sum(p.count(quoted) for p in pieces), 3000, "no value was cut in two")
+        small = '{"a": [{"b": 1}, {"c": 2}]}'
+        self.assertEqual(m.json_pieces(small), [small], "a small file stays whole")
+        pretty = json.dumps({"events": [{"t": "x"}] * 9000}, indent=1)
+        self.assertEqual(m.json_pieces(pretty), [pretty], "a file with line breaks stays whole")
+
+    def test_import_scans_what_it_filed_and_counts_a_value_once_per_file(self):
+        r = self.e.run("import", str(self.export))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("secrets: scanned 1 new or changed file(s)", r.stdout, "only the filed copy is read")
+        report = (self.e.archive / "SECRETS.md").read_text(encoding="utf-8")
+        self.assertNotIn(self.token, report)
+        gh = next(l for l in report.splitlines() if "| GitHub token |" in l)
+        self.assertIn("| 1 | 1 |", gh, "twice in one saved copy is one place, as when the copy was read whole")
+        self.assertIn("all-sessions/cloud/session_01BigCopy000000.json", gh)
+        again = self.e.run("secrets")
+        self.assertNotIn("secrets: scanned", again.stdout, "nothing new to read the second time")
+
+    def test_redact_in_a_cut_copy_replaces_every_occurrence_and_stays_valid_json(self):
+        self.e.run("import", str(self.export))
+        report = (self.e.archive / "SECRETS.md").read_text(encoding="utf-8")
+        fp = re.search(r"\| GitHub token \|.*`([0-9a-f]{12})` \|$", report, re.M).group(1)
+        r = self.e.run("redact", fp, "--apply")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        text = self.copy.read_text(encoding="utf-8")
+        self.assertNotIn(self.token, text)
+        self.assertEqual(text.count("<secret removed: GitHub token, " + fp + ">"), 2)
+        self.assertEqual(len(json.loads(text)["events"]), 1500)
+
+    def test_an_interrupted_scan_keeps_what_it_finished(self):
+        from unittest import mock
+        cloud = self.e.archive / "all-sessions" / "cloud"
+        cloud.mkdir(parents=True, exist_ok=True)
+        for i in range(3):
+            sid = f"session_01Part{i}00000000"
+            (cloud / f"{sid}.json").write_text(big_export_line(sid, self.token))
+        with mock.patch.dict(os.environ, {"CLAUDE_SESSION_ARCHIVE_HOME": str(self.e.conf), "HOME": str(self.e.home)}):
+            m = self.module()  # the cache path is read at import
+        real = m.find_secret_spans
+
+        def stop_at_the_third(unit):
+            if "session_01Part2" in unit:
+                raise KeyboardInterrupt
+            return real(unit)
+        clock = iter(range(0, 10 ** 6, 100))  # each file starts 100 s after the last: past the save interval
+        with mock.patch.object(m, "find_secret_spans", stop_at_the_third), \
+                mock.patch.object(m.time, "monotonic", lambda: next(clock)):
+            with self.assertRaises(KeyboardInterrupt):
+                m.scan_secrets(self.e.archive)
+        files = json.loads(m.SECRETS_CACHE.read_text(encoding="utf-8"))["files"]
+        self.assertIn("all-sessions/cloud/session_01Part000000000.json", files)
+        self.assertIn("all-sessions/cloud/session_01Part100000000.json", files)
+        self.assertNotIn("all-sessions/cloud/session_01Part200000000.json", files)
+
+
 class ReviewTests(Base):
     """One test per finding of the 1.1 review (securityaudit.md, F1 to F12)."""
 
