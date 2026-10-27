@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.7.0 (2026-10-27)
+
+- Faster secrets scan of saved claude.ai copies. Each copy is one JSON line, often tens of MB, so every pattern's anchor occurred somewhere in it and every pattern ran over all of it. It is now read in pieces cut between array elements (never inside a value, where a quote is always escaped), so the anchor check skips most of it, as it does for the lines of a transcript. `redact` cuts the same way, so both agree on what a finding is, and checks that a cut copy is still valid JSON as a whole. A value is still counted once per copy. Measured on the 106 copies of one import (1.5 GB): findings identical to reading them whole, in every file; 9.1 MB/s against 1.9, about 4.8 times faster.
+- The scan cache is saved as the scan goes (at least once a minute), so an interrupted scan resumes instead of starting over; before, everything a long scan had read was lost with it.
+- `import` scans the copies it filed before returning (when `scan_secrets_on_sync` is on), instead of leaving them to the next sync's hook.
+- Progress in a terminal (`scanning for secrets: file 37/106, 412/1523 MB`), and a line in the sync log with how many new files were read and how long it took.
+
 ## 1.6.0 (2026-10-12)
 
 - Memory on every computer: each sync mirrors this computer's memory notes to `all-sessions/memory/<computer>/` and brings here, for projects this computer has, the notes other computers have and this one does not. `memory` lists projects and differences; `memory link <project> <folder> [--apply]` and `memory unlink` join and separate a project that lives elsewhere; `memory forget` drops a note everywhere. Nothing local is overwritten or written through; `MEMORY.md` is merged line by line; a note deleted on one computer is not handed back (recorded by content, per computer); a symlinked or unreadable memory folder is left alone; the home folder is never shared without a link.
